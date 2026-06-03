@@ -45,6 +45,8 @@ Each scraped product record contains:
 | `store_url` | Store URL this item was scraped from |
 | `category` | eBay category name |
 | `item_specifics` | JSON key-value pairs (brand, model, size, colour, etc.) |
+| `mpn` | Manufacturer Part Number (from item specifics) |
+| `upc` | UPC or EAN barcode (from item specifics) |
 | `shipping` | Free / cost amount |
 | `listing_type` | Buy It Now / Auction |
 | `scraped_at` | Timestamp |

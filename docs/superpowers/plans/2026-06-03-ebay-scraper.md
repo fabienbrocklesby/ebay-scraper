@@ -21,7 +21,7 @@ ebay-scraper/
 │   ├── db.py           - Postgres schema + async CRUD (asyncpg, used by CLI)
 │   ├── queue.py        - rq job queue helpers: enqueue with dedup, get queue/redis
 │   ├── store.py        - eBay store paginator: given store URL, returns list of item IDs
-│   ├── scraper.py      - eBay item detail page parser: returns ProductData dataclass
+│   ├── scraper.py      - eBay item detail page parser: returns ProductData dataclass (includes mpn, upc)
 │   ├── worker.py       - rq job function scrape_and_store (sync, psycopg2), start_worker
 │   └── export.py       - Queries Postgres, writes CSV
 ├── tests/
@@ -407,6 +407,8 @@ class ProductRecord:
     store_url: str
     category: str
     item_specifics: str
+    mpn: str
+    upc: str
     shipping: str
     listing_type: str
     niche: str
@@ -426,6 +428,8 @@ async def init_schema(pool: asyncpg.Pool) -> None:
             store_url    TEXT,
             category     TEXT,
             item_specifics TEXT,
+            mpn          TEXT,
+            upc          TEXT,
             shipping     TEXT,
             listing_type TEXT,
             niche        TEXT,
@@ -438,21 +442,22 @@ async def insert_product(pool: asyncpg.Pool, record: ProductRecord) -> None:
         INSERT INTO products (
             item_id, title, price, currency, condition, description,
             image_urls, item_url, seller_id, store_url, category,
-            item_specifics, shipping, listing_type, niche, scraped_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            item_specifics, mpn, upc, shipping, listing_type, niche, scraped_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
         ON CONFLICT (item_id) DO UPDATE SET
             title=EXCLUDED.title, price=EXCLUDED.price, currency=EXCLUDED.currency,
             condition=EXCLUDED.condition, description=EXCLUDED.description,
             image_urls=EXCLUDED.image_urls, item_url=EXCLUDED.item_url,
             seller_id=EXCLUDED.seller_id, store_url=EXCLUDED.store_url,
             category=EXCLUDED.category, item_specifics=EXCLUDED.item_specifics,
+            mpn=EXCLUDED.mpn, upc=EXCLUDED.upc,
             shipping=EXCLUDED.shipping, listing_type=EXCLUDED.listing_type,
             niche=EXCLUDED.niche, scraped_at=EXCLUDED.scraped_at
     """,
         record.item_id, record.title, record.price, record.currency,
         record.condition, record.description, record.image_urls, record.item_url,
         record.seller_id, record.store_url, record.category, record.item_specifics,
-        record.shipping, record.listing_type, record.niche,
+        record.mpn, record.upc, record.shipping, record.listing_type, record.niche,
         datetime.now(timezone.utc),
     )
 
@@ -817,6 +822,8 @@ class ProductData:
     seller_id: str
     category: str
     item_specifics: str
+    mpn: str
+    upc: str
     shipping: str
     listing_type: str
 
@@ -842,6 +849,17 @@ def _extract_item_specifics(soup: BeautifulSoup) -> str:
             if key and val:
                 specifics[key] = val
     return json.dumps(specifics)
+
+def _extract_identifier(specifics_json: str, *keys: str) -> str:
+    try:
+        specifics = json.loads(specifics_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    for key in keys:
+        val = specifics.get(key, "")
+        if val:
+            return val
+    return ""
 
 def _extract_shipping(soup: BeautifulSoup) -> str:
     for span in soup.select("span.ux-textspans--BOLD"):
@@ -912,6 +930,8 @@ def scrape_item(
         seller_id=(offers.get("seller") or {}).get("name", ""),
         category=ld_json.get("category", ""),
         item_specifics=_extract_item_specifics(soup),
+        mpn=_extract_identifier(_extract_item_specifics(soup), "MPN", "Manufacturer Part Number", "mpn"),
+        upc=_extract_identifier(_extract_item_specifics(soup), "UPC", "EAN", "ISBN", "upc"),
         shipping=_extract_shipping(soup),
         listing_type=_extract_listing_type(soup),
     )
@@ -1022,14 +1042,15 @@ INSERT_SQL = """
     INSERT INTO products (
         item_id, title, price, currency, condition, description,
         image_urls, item_url, seller_id, store_url, category,
-        item_specifics, shipping, listing_type, niche, scraped_at
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        item_specifics, mpn, upc, shipping, listing_type, niche, scraped_at
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT (item_id) DO UPDATE SET
         title=EXCLUDED.title, price=EXCLUDED.price, currency=EXCLUDED.currency,
         condition=EXCLUDED.condition, description=EXCLUDED.description,
         image_urls=EXCLUDED.image_urls, item_url=EXCLUDED.item_url,
         seller_id=EXCLUDED.seller_id, store_url=EXCLUDED.store_url,
         category=EXCLUDED.category, item_specifics=EXCLUDED.item_specifics,
+        mpn=EXCLUDED.mpn, upc=EXCLUDED.upc,
         shipping=EXCLUDED.shipping, listing_type=EXCLUDED.listing_type,
         niche=EXCLUDED.niche, scraped_at=EXCLUDED.scraped_at
 """
@@ -1047,7 +1068,8 @@ def scrape_and_store(item_id: str, niche: str, store_url: str) -> None:
                 product.item_id, product.title, product.price, product.currency,
                 product.condition, product.description, product.image_urls,
                 product.item_url, product.seller_id, store_url, product.category,
-                product.item_specifics, product.shipping, product.listing_type,
+                product.item_specifics, product.mpn, product.upc,
+                product.shipping, product.listing_type,
                 niche, datetime.now(timezone.utc),
             ))
         conn.commit()
@@ -1277,7 +1299,7 @@ async def test_export_csv_has_all_columns(db_pool, tmp_path):
     expected = [
         "item_id", "title", "price", "currency", "condition", "description",
         "image_urls", "item_url", "seller_id", "store_url", "category",
-        "item_specifics", "shipping", "listing_type", "niche", "scraped_at",
+        "item_specifics", "mpn", "upc", "shipping", "listing_type", "niche", "scraped_at",
     ]
     for col in expected:
         assert col in columns, f"Missing column: {col}"
@@ -1301,7 +1323,7 @@ from scraper.db import get_products_by_niche
 CSV_COLUMNS = [
     "item_id", "title", "price", "currency", "condition", "description",
     "image_urls", "item_url", "seller_id", "store_url", "category",
-    "item_specifics", "shipping", "listing_type", "niche", "scraped_at",
+    "item_specifics", "mpn", "upc", "shipping", "listing_type", "niche", "scraped_at",
 ]
 
 async def export_to_csv(
