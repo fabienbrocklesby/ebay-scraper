@@ -1,72 +1,107 @@
 # eBay Scraper
 
-Distributed eBay product scraper. Scrapes full product data from eBay seller store URLs at scale (1M+ products/day across multiple VPS nodes) and outputs to CSV.
+Distributed eBay product scraper. Scrapes full product data from eBay seller store URLs at scale and outputs to CSV.
 
-**Architecture:** one coordinator VPS runs Redis (job queue) and Postgres (results). Any number of worker VPS nodes pull item IDs from the queue, scrape eBay, and write results to Postgres. Adding more workers increases throughput linearly, with no code changes.
+**Architecture:** one coordinator machine runs Redis (job queue) and Postgres (results). Any number of worker VPS nodes connect to it, pull jobs from the queue, scrape eBay, and write results. Adding workers increases throughput linearly with no code changes.
 
 ---
 
-## Requirements
+## Install
 
-- Python 3.11+
-- Docker (coordinator only, for Redis and Postgres)
+```bash
+pipx install git+https://github.com/OWNER/ebay-scraper
+```
+
+Installs the `scraper` command globally. Works on macOS and Linux. Requires Python 3.11+ and pipx.
+
+To update:
+
+```bash
+pipx reinstall ebay-scraper
+```
+
+---
+
+## Network Setup (Tailscale, recommended)
+
+Tailscale creates an encrypted private network between your machines so Redis and Postgres are never exposed to the public internet.
+
+1. Install Tailscale on each machine: https://tailscale.com/download
+2. Run `tailscale up` on each machine to join your tailnet
+3. Use the Tailscale hostname (e.g. `mycoordinator.tail1234.ts.net`) when connecting workers
+
+Skip this step only for single-machine or LAN setups.
 
 ---
 
 ## Coordinator Setup
 
-Run once on the coordinator VPS:
+Run once on the machine that will host Redis and Postgres (requires Docker):
 
 ```bash
-git clone <repo-url> ebay-scraper
-cd ebay-scraper
+scraper coordinator start
+scraper connect localhost
+scraper db init
+```
 
-pip install -e .
+`coordinator start` launches Redis and Postgres as Docker containers with `restart: unless-stopped`.
 
-cp .env.example .env
-# Edit .env: set DATABASE_URL, REDIS_URL, and optionally PROXY_URL
+To check status or stop:
 
-docker compose up -d    # starts Redis and Postgres
-scraper db init         # creates the products table
+```bash
+scraper coordinator status
+scraper coordinator stop
 ```
 
 ---
 
-## Worker Setup
+## Adding Worker VPS Nodes
 
-Run on each worker VPS:
+On each worker VPS:
+
+**Option 1: Docker worker (recommended)**
 
 ```bash
-git clone <repo-url> ebay-scraper
+# Build the worker image (clone repo first, or copy Dockerfile)
+git clone https://github.com/OWNER/ebay-scraper
 cd ebay-scraper
+docker build -t ebay-scraper-worker .
 
-pip install -e .
-
-cp .env.example .env
-# Edit .env: point REDIS_URL and DATABASE_URL at the coordinator VPS IP
-
-scraper worker start    # runs until Ctrl+C
+# Connect to coordinator, then print the docker run command
+scraper connect <coordinator-tailscale-hostname>
+scraper worker docker-run
 ```
 
-Add more workers at any time by repeating this on additional VPS nodes.
+Copy the printed `docker run` command and run it. It includes `--restart=always` so the worker survives reboots.
+
+**Option 2: Direct Python (if Python 3.11+ is available)**
+
+```bash
+pipx install git+https://github.com/OWNER/ebay-scraper
+scraper connect <coordinator-tailscale-hostname>
+scraper worker start
+```
 
 ---
 
 ## Usage
 
-### Add a store to the queue
+### Add stores to the queue
 
 ```bash
-# Single store URL
+# Single store
 scraper add https://www.ebay.com/str/sellername --niche car-accessories
+
+# Australian eBay
+scraper add https://www.ebay.com.au/str/sellername --niche car-accessories
 
 # File of store URLs (one per line)
 scraper add stores.txt --niche car-accessories
 ```
 
-The `--niche` tag groups items for filtered exports later. The command fetches all item IDs from the store, skips any already queued or scraped, and adds the rest to the Redis job queue.
+The `--niche` tag groups items for filtered exports. The command crawls the store, skips already-queued items, and adds the rest to the Redis queue. Workers pick them up automatically.
 
-### Check queue and scrape progress
+### Check progress
 
 ```bash
 scraper status
@@ -81,15 +116,15 @@ Shows jobs waiting in queue, total products scraped, and a per-niche breakdown.
 scraper export --output all-products.csv
 
 # Single niche
-scraper export --niche car-accessories --output car-accessories.csv
+scraper export --niche car-accessories --output car.csv
 ```
 
 CSV columns: `item_id, title, price, currency, condition, description, image_urls, item_url, seller_id, store_url, category, item_specifics, mpn, upc, shipping, listing_type, niche, scraped_at`
 
-- `image_urls`: pipe-separated list of image URLs
-- `item_specifics`: JSON object of all eBay item specifics (brand, model, colour, etc.)
-- `mpn`: Manufacturer Part Number, extracted from item specifics
-- `upc`: UPC/EAN barcode, extracted from item specifics
+- `image_urls`: pipe-separated list of image URLs (no downloading)
+- `item_specifics`: JSON of all eBay item specifics (brand, model, colour, etc.)
+- `mpn`: Manufacturer Part Number extracted from item specifics
+- `upc`: UPC/EAN barcode extracted from item specifics
 
 ### Clear a niche
 
@@ -97,39 +132,35 @@ CSV columns: `item_id, title, price, currency, condition, description, image_url
 scraper clear --niche car-accessories
 ```
 
-Removes all scraped records for that niche. Prompts for confirmation.
-
 ---
 
 ## Configuration
 
-All settings are read from `.env` in the project root (or environment variables).
+Config is stored at `~/.config/ebay-scraper/.env` (written by `scraper connect`). You can also set these as environment variables, which take precedence.
 
 | Variable | Required | Description |
 |---|---|---|
-| `REDIS_URL` | Yes | Redis connection string, e.g. `redis://coordinator-ip:6379` |
-| `DATABASE_URL` | Yes | Postgres DSN, e.g. `postgresql://scraper:scraper@coordinator-ip/ebayscraper` |
-| `PROXY_URL` | No | Rotating residential proxy, format `http://user:pass@host:port` |
-| `REQUESTS_PER_SECOND` | No | Rate limit per worker (default: 0.5) |
+| `REDIS_URL` | Yes | e.g. `redis://coordinator.ts.net:6379` |
+| `DATABASE_URL` | Yes | e.g. `postgresql://scraper:scraper@coordinator.ts.net:5432/ebayscraper` |
+| `PROXY_URL` | No | Rotating residential proxy: `http://user:pass@host:port` |
+| `REQUESTS_PER_SECOND` | No | Rate per worker (default: 0.5) |
+
+A residential proxy is required for VPS workers to scrape eBay item pages. Datacenter IPs receive JS challenge pages rather than product data. Set `PROXY_URL` before starting workers on a VPS.
 
 ---
 
 ## Scale Reference
 
-| Workers | Items/day (at 0.5 req/s) |
+| Workers | Items/day at 0.5 req/s |
 |---|---|
 | 1 | ~43,000 |
 | 5 | ~216,000 |
 | 10 | ~432,000 |
 | 25 | ~1,080,000 |
 
-Throughput scales linearly. Increase `REQUESTS_PER_SECOND` with a residential proxy to push higher per-worker rates.
-
 ---
 
-## Running Tests
-
-Requires Docker running:
+## Running Tests (development)
 
 ```bash
 docker compose up -d

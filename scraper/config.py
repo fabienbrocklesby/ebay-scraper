@@ -1,8 +1,23 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def _find_dotenv() -> Path | None:
+    global_env = Path.home() / ".config" / "ebay-scraper" / ".env"
+    if global_env.exists():
+        return global_env
+    cwd_env = Path.cwd() / ".env"
+    if cwd_env.exists():
+        return cwd_env
+    return None
+
+
+_env_path = _find_dotenv()
+if _env_path:
+    load_dotenv(dotenv_path=_env_path)
+
 
 @dataclass
 class Settings:

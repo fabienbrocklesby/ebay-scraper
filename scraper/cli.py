@@ -1,4 +1,7 @@
 import asyncio
+import subprocess
+from importlib.resources import as_file, files
+from pathlib import Path
 
 import asyncpg
 import click
@@ -10,10 +13,152 @@ from scraper.queue import enqueue_items, get_queue, get_redis
 from scraper.store import get_item_urls_from_store
 from scraper.worker import start_worker
 
+_CONFIG_DIR = Path.home() / ".config" / "ebay-scraper"
+_COMPOSE_PROJECT = "ebay-scraper"
+
 
 @click.group()
 def cli() -> None:
     """eBay scraper: queue stores, run workers, export results."""
+
+
+# ---------------------------------------------------------------------------
+# coordinator
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def coordinator() -> None:
+    """Coordinator services (Redis + Postgres). Run on the coordinator machine."""
+
+
+@coordinator.command("start")
+def coordinator_start() -> None:
+    """Start Redis and Postgres on this machine."""
+    compose_ref = files("scraper") / "coordinator-compose.yml"
+    with as_file(compose_ref) as compose_path:
+        subprocess.run(
+            ["docker", "compose", "-p", _COMPOSE_PROJECT, "-f", str(compose_path), "up", "-d"],
+            check=True,
+        )
+    click.echo("Coordinator started.")
+    click.echo("  Redis:    localhost:6379")
+    click.echo("  Postgres: localhost:5432  (user: scraper, db: ebayscraper)")
+    click.echo("")
+    click.echo("Next: run 'scraper connect <this-machine-ip-or-tailscale-host>' on each worker.")
+
+
+@coordinator.command("stop")
+def coordinator_stop() -> None:
+    """Stop coordinator services."""
+    compose_ref = files("scraper") / "coordinator-compose.yml"
+    with as_file(compose_ref) as compose_path:
+        subprocess.run(
+            ["docker", "compose", "-p", _COMPOSE_PROJECT, "-f", str(compose_path), "down"],
+            check=True,
+        )
+    click.echo("Coordinator stopped.")
+
+
+@coordinator.command("status")
+def coordinator_status() -> None:
+    """Show coordinator container status."""
+    compose_ref = files("scraper") / "coordinator-compose.yml"
+    with as_file(compose_ref) as compose_path:
+        subprocess.run(
+            ["docker", "compose", "-p", _COMPOSE_PROJECT, "-f", str(compose_path), "ps"],
+            check=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# connect
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("host")
+@click.option("--db-password", default="scraper", show_default=True, help="Postgres password")
+@click.option("--db-user", default="scraper", show_default=True, help="Postgres user")
+@click.option("--db-name", default="ebayscraper", show_default=True, help="Postgres database")
+@click.option("--redis-port", default=6379, show_default=True)
+@click.option("--db-port", default=5432, show_default=True)
+@click.option("--proxy", default="", help="Rotating residential proxy URL (http://user:pass@host:port)")
+@click.option("--rate", default=0.5, show_default=True, help="Requests per second")
+def connect(
+    host: str,
+    db_password: str,
+    db_user: str,
+    db_name: str,
+    redis_port: int,
+    db_port: int,
+    proxy: str,
+    rate: float,
+) -> None:
+    """Configure this machine to connect to a coordinator.
+
+    HOST is the coordinator's IP address or Tailscale hostname.
+    """
+    redis_url = f"redis://{host}:{redis_port}"
+    db_url = f"postgresql://{db_user}:{db_password}@{host}:{db_port}/{db_name}"
+
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    env_path = _CONFIG_DIR / ".env"
+    env_path.write_text(
+        f"REDIS_URL={redis_url}\n"
+        f"DATABASE_URL={db_url}\n"
+        f"PROXY_URL={proxy}\n"
+        f"REQUESTS_PER_SECOND={rate}\n"
+    )
+
+    click.echo(f"Config written to {env_path}")
+    click.echo(f"  Redis:    {redis_url}")
+    click.echo(f"  Postgres: {db_url}")
+    click.echo("")
+    click.echo("Start a worker:  scraper worker start")
+    click.echo("Docker command:  scraper worker docker-run")
+
+
+# ---------------------------------------------------------------------------
+# worker
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def worker() -> None:
+    """Worker commands."""
+
+
+@worker.command("start")
+def worker_start() -> None:
+    """Start a scrape worker on this machine (runs until Ctrl+C)."""
+    settings = Settings()
+    click.echo("Starting worker. Press Ctrl+C to stop.")
+    start_worker(settings.redis_url)
+
+
+@worker.command("docker-run")
+@click.option("--image", default="ebay-scraper-worker", show_default=True, help="Docker image name")
+def worker_docker_run(image: str) -> None:
+    """Print the docker run command for running a worker on any machine.
+
+    Build the image first:  docker build -t ebay-scraper-worker <repo-path>
+    """
+    settings = Settings()
+    proxy = settings.proxy_url or ""
+    click.echo(
+        f"docker run -d --restart=always \\\n"
+        f"  -e REDIS_URL={settings.redis_url} \\\n"
+        f"  -e DATABASE_URL={settings.database_url} \\\n"
+        f"  -e PROXY_URL={proxy} \\\n"
+        f"  -e REQUESTS_PER_SECOND={settings.requests_per_second} \\\n"
+        f"  {image}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# add
+# ---------------------------------------------------------------------------
 
 
 @cli.command()
@@ -47,17 +192,9 @@ def add(source: str, niche: str) -> None:
     click.echo(f"Done. {total} total items added to queue.")
 
 
-@cli.group()
-def worker() -> None:
-    """Worker commands."""
-
-
-@worker.command("start")
-def worker_start() -> None:
-    """Start a scrape worker on this VPS (runs until Ctrl+C)."""
-    settings = Settings()
-    click.echo("Starting worker. Press Ctrl+C to stop.")
-    start_worker(settings.redis_url)
+# ---------------------------------------------------------------------------
+# export
+# ---------------------------------------------------------------------------
 
 
 @cli.command()
@@ -76,6 +213,11 @@ def export(output: str, niche: str | None) -> None:
             await pool.close()
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
 
 
 @cli.command()
@@ -102,6 +244,11 @@ def status() -> None:
     asyncio.run(_run())
 
 
+# ---------------------------------------------------------------------------
+# db
+# ---------------------------------------------------------------------------
+
+
 @cli.group()
 def db() -> None:
     """Database management (run on coordinator only)."""
@@ -121,6 +268,11 @@ def db_init() -> None:
             await pool.close()
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# clear
+# ---------------------------------------------------------------------------
 
 
 @cli.command()
