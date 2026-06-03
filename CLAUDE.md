@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A distributed eBay product scraper built for Kieran Granger. Scrapes full product data from eBay seller store URLs at scale (1M+ products/day across multiple VPS nodes), outputs to CSV. $500 NZD project.
+A distributed eBay product scraper built for Kieran Granger. Scrapes full product data from eBay seller store URLs at scale (1M+ products/day across multiple VPS nodes), outputs to CSV. $500 NZD project. This tool will run in production for years with zero maintenance.
 
 ## Status
 
@@ -12,13 +12,54 @@ A distributed eBay product scraper built for Kieran Granger. Scrapes full produc
 
 `docs/superpowers/plans/2026-06-03-ebay-scraper.md`
 
-Read this first. It contains every task with complete code for every step. Execute it task by task using the `superpowers:subagent-driven-development` or `superpowers:executing-plans` skill.
+Read this fully before writing any code. It contains every task with complete code for every step. Execute it task by task.
 
 ## Design Spec
 
 `docs/superpowers/specs/2026-06-03-ebay-scraper-design.md`
 
-Reference for architecture decisions.
+Reference for architecture decisions. Do not deviate from this without a strong reason.
+
+---
+
+## Engineering Standards (non-negotiable)
+
+This tool will run unsupervised in production for years. There is no maintenance plan. Every decision must be made with that in mind.
+
+### Code Quality
+
+- **Senior engineer standard throughout.** Every file should be readable and maintainable by a Python developer who has never seen this codebase.
+- **Minimal dependencies.** Every dependency is a future maintenance burden. Only add a package if the stdlib genuinely cannot do the job. Do not add convenience wrappers around things Python already does well.
+- **Right tool for the right job.** Do not use async where sync is cleaner and sufficient. Do not use a heavy framework where a simple function works. The plan's sync/async boundary is deliberate - respect it.
+- **Modular, single-responsibility files.** Each file in `scraper/` does one thing. If a file starts doing two things, it needs to be split.
+- **No tech debt.** Do not leave TODOs, commented-out code, half-finished error handling, or "good enough for now" shortcuts. If something is worth doing, do it properly or flag it explicitly.
+- **Clean, self-documenting code.** Well-named functions and variables are the documentation. Do not write comments that explain what the code does. Only write a comment when the WHY is non-obvious: a hidden constraint, a workaround for a specific external behaviour, or an invariant that would surprise a reader.
+- **Follow PEP 8 and Python idioms.** Use type hints throughout. Use dataclasses for data structures. Use pathlib where paths are involved. Do not use bare `except:`. Do not suppress exceptions silently.
+- **Explicit is better than implicit.** No magic. No monkey-patching. No global mutable state.
+
+### Documentation
+
+- Before implementing any module, use **Context7 MCP** to fetch current official docs for the library being used. Do this for every library: httpx, rq, asyncpg, psycopg2, click, pytest-asyncio, respx, beautifulsoup4. Do not rely on training data - library APIs change and training data is stale.
+- Fetch docs with: `mcp__context7__resolve-library-id` then `mcp__context7__query-docs` with the specific question (e.g. "httpx proxies configuration", "rq job timeout", "asyncpg connection pool").
+- Always conform to the patterns and idioms shown in the official docs, not to patterns from memory.
+
+### Testing
+
+- **TDD strictly.** Write the failing test before writing implementation code. Run it to confirm it fails. Then write the minimum code to make it pass. Never skip this cycle.
+- **Do not stop until every test passes and you are confident the code will run in production.** If a test is flaky, fix the underlying issue - do not delete the test or add `pytest.mark.skip`.
+- **Test real behaviour, not implementation details.** Tests should assert on outputs and side effects, not on which internal functions were called.
+- **Cover failure paths.** Every module that makes a network call or DB write needs tests for failure cases: 404, network timeout, DB unavailable, malformed HTML. Use `respx` for HTTP mocking.
+- **Integration test is mandatory.** The full flow (scrape item -> write to DB -> export CSV) must pass before the implementation is considered complete.
+- Run the full test suite with `pytest -v` at the end of every task. Do not proceed to the next task if any test is failing.
+
+### Scraper Robustness
+
+- eBay's HTML structure changes. The scraper must not crash on unexpected page structure - return `None` gracefully and let the queue retry.
+- JSON-LD parsing must handle missing keys, wrong types, and partial data without raising exceptions.
+- All network calls must have explicit timeouts. Never use default (infinite) timeouts.
+- Retry logic with exponential backoff on transient failures (5xx, connection errors). Do not retry 404s.
+
+---
 
 ## Architecture Summary
 
@@ -30,10 +71,10 @@ Reference for architecture decisions.
 ## Tech Stack
 
 - Python 3.11+
-- `httpx` - async HTTP scraping
+- `httpx` - HTTP scraping (sync client in workers)
 - `beautifulsoup4` - HTML parsing
 - `rq` - Redis job queue
-- `psycopg2-binary` - sync DB writes in workers
+- `psycopg2-binary` - sync DB writes in workers (intentional: rq workers must be sync)
 - `asyncpg` - async DB reads in CLI (export, status)
 - `click` - CLI
 - `python-dotenv` - config
@@ -74,8 +115,8 @@ README.md
 
 - `image_urls`: pipe-separated list of image URLs (no downloading)
 - `item_specifics`: JSON object of all eBay item specifics (brand, model, colour, etc.)
-- `mpn`: Manufacturer Part Number extracted from item_specifics
-- `upc`: UPC/EAN barcode extracted from item_specifics
+- `mpn`: Manufacturer Part Number extracted from item_specifics keys "MPN", "Manufacturer Part Number"
+- `upc`: UPC/EAN barcode extracted from item_specifics keys "UPC", "EAN"
 - `niche`: tag set at scrape time, used to filter exports
 
 ## Key Implementation Notes
@@ -84,7 +125,6 @@ README.md
 - CLI commands that read/export use **asyncpg (async)** wrapped in `asyncio.run()`.
 - Deduplication: a Redis set (`scraped_items`) tracks queued item IDs. `scraper add` skips IDs already in the set.
 - Scraper parses **JSON-LD** (`<script type="application/ld+json">`) from eBay item pages - more stable than CSS selectors.
-- `mpn` and `upc` are extracted from item_specifics JSON after parsing - look for keys "MPN", "Manufacturer Part Number", "UPC", "EAN".
 - Proxy: set `PROXY_URL` in `.env`, format `http://user:pass@host:port`. Workers pass it to httpx as proxies dict.
 
 ## Config (.env)
@@ -104,7 +144,3 @@ docker compose up -d
 docker exec $(docker ps -qf "ancestor=postgres:16-alpine") psql -U scraper -c "CREATE DATABASE ebayscraper_test;" 2>/dev/null || true
 pytest -v
 ```
-
-## TDD Approach
-
-The plan uses TDD. For each module: write the failing test first, run it to confirm failure, then implement the minimum code to make it pass. Do not skip this - the tests catch real bugs in the scraper selectors and SQL.
