@@ -2,26 +2,10 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
-import httpx
 from bs4 import BeautifulSoup
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 
 @dataclass
@@ -129,16 +113,20 @@ def _find_product_ld(soup: BeautifulSoup) -> Optional[dict]:
 def scrape_item(
     item_url: str,
     proxy_url: Optional[str] = None,
-    client: Optional[httpx.Client] = None,
+    client: Optional[Any] = None,
 ) -> Optional[ProductData]:
     """Fetch an eBay item page and return structured product data, or None on failure.
 
     Accepts a full item URL (e.g. https://www.ebay.com.au/itm/123456789) so that
     non-US eBay domains are handled correctly.
 
-    When no client is provided, warms a fresh session by visiting the eBay homepage
-    first. This establishes cookies required to bypass eBay's bot detection on item
-    detail pages.
+    When no client is provided, creates a curl_cffi session that impersonates
+    Chrome's TLS fingerprint. eBay uses JA3/JA4 TLS fingerprinting to detect
+    Python scrapers regardless of User-Agent or IP. curl_cffi bypasses this by
+    using the exact TLS handshake Chrome produces. A homepage warmup request
+    establishes session cookies before the item page fetch.
+
+    Pass client explicitly only in tests (inject an httpx.Client for respx mocking).
     """
     parsed = urlparse(item_url)
     homepage = f"{parsed.scheme}://{parsed.netloc}/"
@@ -146,17 +134,14 @@ def scrape_item(
 
     try:
         if own_client:
-            client_kwargs: dict = {
-                "headers": HEADERS,
-                "timeout": 30,
-                "follow_redirects": True,
-            }
+            from curl_cffi.requests import Session
+            session_kwargs: dict[str, Any] = {"impersonate": "chrome131"}
             if proxy_url:
-                client_kwargs["proxy"] = proxy_url
-            client = httpx.Client(**client_kwargs)
+                session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            client = Session(**session_kwargs)
             try:
                 client.get(homepage)
-            except httpx.HTTPError:
+            except Exception:
                 pass
             time.sleep(1.0)
 
@@ -172,7 +157,7 @@ def scrape_item(
         if response.status_code == 404:
             return None
         response.raise_for_status()
-    except httpx.HTTPError:
+    except Exception:
         return None
     finally:
         if own_client and client:

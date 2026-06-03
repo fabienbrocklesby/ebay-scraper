@@ -70,7 +70,10 @@ def test_get_item_urls_from_store_returns_urls():
     respx.get("https://www.ebay.com/").mock(return_value=httpx.Response(200, text=homepage_html))
     respx.get("https://www.ebay.com/str/testseller").mock(return_value=httpx.Response(200, text=store_html))
 
-    urls = get_item_urls_from_store("https://www.ebay.com/str/testseller", max_pages=1)
+    session = httpx.Client(follow_redirects=True)
+    urls = get_item_urls_from_store(
+        "https://www.ebay.com/str/testseller", max_pages=1, _session=session
+    )
     assert "https://www.ebay.com/itm/111111111" in urls
     assert "https://www.ebay.com/itm/222222222" in urls
     assert len(urls) == 2
@@ -81,5 +84,8 @@ def test_get_item_urls_returns_empty_on_no_listings():
     respx.get("https://www.ebay.com/").mock(return_value=httpx.Response(200, text="<html></html>"))
     respx.get("https://www.ebay.com/str/emptyseller").mock(return_value=httpx.Response(200, text="<html><body></body></html>"))
 
-    urls = get_item_urls_from_store("https://www.ebay.com/str/emptyseller", max_pages=1)
+    session = httpx.Client(follow_redirects=True)
+    urls = get_item_urls_from_store(
+        "https://www.ebay.com/str/emptyseller", max_pages=1, _session=session
+    )
     assert urls == []

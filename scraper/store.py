@@ -1,23 +1,23 @@
 import re
 import time
-import httpx
+from typing import Any
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Upgrade-Insecure-Requests": "1",
-}
+
+def _sch_to_str_url(url: str) -> str | None:
+    """Convert an eBay /sch/ seller-filtered URL to the equivalent /str/ store URL.
+
+    eBay's /sch/ endpoint returns 403 to non-browser clients. The /str/ store
+    pages are accessible and use a.str-item-card__link for item links.
+    """
+    parsed = urlparse(url)
+    if "/sch/" not in parsed.path:
+        return None
+    ssn = parse_qs(parsed.query).get("_ssn", [None])[0]
+    if not ssn:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/str/{ssn}"
 
 
 def extract_seller_id(store_url: str) -> str:
@@ -67,37 +67,45 @@ def get_item_urls_from_store(
     proxy_url: str | None = None,
     requests_per_second: float = 0.5,
     max_pages: int = 9999,
+    _session: Any | None = None,
 ) -> list[str]:
     """Paginate through a seller store and return a deduplicated list of item URLs.
 
     eBay's search API (/sch/i.html) blocks programmatic access. This function
     paginates the store's own /str/ page (?_pgn=N), which is accessible.
 
-    Warms the session by visiting the eBay homepage first so that cookies are
-    established before hitting the store and item pages. This is required to
-    avoid bot-detection blocks on item detail pages.
+    Uses curl_cffi to impersonate Chrome's TLS fingerprint (JA3/JA4), bypassing
+    eBay's bot detection layer. A homepage warmup establishes session cookies.
+
+    _session: inject an httpx.Client in tests so respx can mock network calls.
+    Production always uses curl_cffi (pass nothing).
 
     Returns full item URLs (e.g. https://www.ebay.com.au/itm/123) so the
     correct domain is preserved for non-US eBay sites.
     """
+    converted = _sch_to_str_url(store_url)
+    if converted:
+        store_url = converted
     base_store_url = _normalize_store_url(store_url)
     homepage = _homepage_url(store_url)
     delay = 1.0 / requests_per_second if requests_per_second > 0 else 2.0
 
-    client_kwargs: dict = {
-        "headers": HEADERS,
-        "timeout": 30,
-        "follow_redirects": True,
-    }
-    if proxy_url:
-        client_kwargs["proxy"] = proxy_url
+    own_client = _session is None
+    if own_client:
+        from curl_cffi.requests import Session
+        session_kwargs: dict[str, Any] = {"impersonate": "chrome131"}
+        if proxy_url:
+            session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        client = Session(**session_kwargs)
+    else:
+        client = _session
 
     seen: dict[str, None] = {}
 
-    with httpx.Client(**client_kwargs) as client:
+    try:
         try:
             client.get(homepage)
-        except httpx.HTTPError:
+        except Exception:
             pass
         time.sleep(max(0.5, delay))
 
@@ -106,8 +114,12 @@ def get_item_urls_from_store(
                 base_store_url if page == 1
                 else f"{base_store_url}?_pgn={page}"
             )
-            response = client.get(page_url)
-            response.raise_for_status()
+            try:
+                response = client.get(page_url)
+                if response.status_code != 200:
+                    break
+            except Exception:
+                break
 
             for url in _extract_item_urls(response.text):
                 seen[url] = None
@@ -116,5 +128,8 @@ def get_item_urls_from_store(
                 break
             if page < max_pages:
                 time.sleep(delay)
+    finally:
+        if own_client:
+            client.close()
 
     return list(seen.keys())
