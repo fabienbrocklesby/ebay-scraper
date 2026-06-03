@@ -10,10 +10,13 @@ import asyncpg
 import click
 
 from scraper.config import Settings
-from scraper.db import clear_niche, get_counts, init_schema
+from scraper.db import (
+    add_store, clear_niche, get_counts, init_schema, list_stores, remove_store,
+)
 from scraper.export import export_to_csv
-from scraper.queue import enqueue_items, get_queue, get_redis
-from scraper.store import get_item_urls_from_store
+from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
+from scraper.scraper import scrape_item
+from scraper.store import _sch_to_str_url, _normalize_store_url, get_item_urls_from_store
 from scraper.worker import start_worker
 
 _CONFIG_DIR = Path.home() / ".config" / "ebay-scraper"
@@ -364,39 +367,296 @@ def worker_docker_run(image: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# add
+# store
 # ---------------------------------------------------------------------------
 
 
-@cli.command()
-@click.argument("source")
-@click.option("--niche", required=True, help="Tag for this batch (e.g. car-accessories)")
-def add(source: str, niche: str) -> None:
-    """Add a store URL or text file of URLs to the scrape queue."""
+@cli.group()
+def store() -> None:
+    """Manage the list of stores to scrape."""
+
+
+def _canonical_store_url(url: str) -> str:
+    converted = _sch_to_str_url(url)
+    return _normalize_store_url(converted if converted else url)
+
+
+@store.command("add")
+@click.argument("url")
+@click.option("--niche", required=True, help="Tag for this store (e.g. electronics)")
+def store_add(url: str, niche: str) -> None:
+    """Register a store URL for scraping.
+
+    Run 'scraper scrape start' to begin scraping all registered stores.
+    URL can be an eBay /str/ or /sch/ seller URL.
+    """
+    settings = Settings()
+    canonical = _canonical_store_url(url)
+    if canonical != url:
+        click.echo(f"  (converted to canonical URL: {canonical})")
+
+    async def _run() -> None:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            await add_store(pool, canonical, niche)
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+    click.echo(f"Store registered: {canonical}  [{niche}]")
+    click.echo("Run 'scraper scrape start' to begin scraping.")
+
+
+@store.command("list")
+def store_list() -> None:
+    """List all registered stores."""
     settings = Settings()
 
-    if source.startswith("http"):
-        store_urls = [source]
+    async def _run() -> list:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            return await list_stores(pool)
+        finally:
+            await pool.close()
+
+    stores = asyncio.run(_run())
+    if not stores:
+        click.echo("No stores registered. Use 'scraper store add <url> --niche <tag>'")
+        return
+    for s in stores:
+        click.echo(f"  {s['store_url']}  [{s['niche']}]  added {s['added_at'].strftime('%Y-%m-%d')}")
+
+
+@store.command("remove")
+@click.argument("url")
+def store_remove(url: str) -> None:
+    """Remove a store from the registered list."""
+    settings = Settings()
+    canonical = _canonical_store_url(url)
+
+    async def _run() -> bool:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            return await remove_store(pool, canonical)
+        finally:
+            await pool.close()
+
+    found = asyncio.run(_run())
+    if found:
+        click.echo(f"Removed: {canonical}")
     else:
-        with open(source) as f:
-            store_urls = [line.strip() for line in f if line.strip()]
+        click.echo(f"Not found: {canonical}", err=True)
+
+
+# ---------------------------------------------------------------------------
+# scrape
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def scrape() -> None:
+    """Control scraping (start, stop, status)."""
+
+
+@scrape.command("start")
+@click.option("--niche", default=None, help="Only scrape stores with this niche tag")
+def scrape_start(niche: str | None) -> None:
+    """Paginate all registered stores and queue item scrape jobs for VPS workers.
+
+    Store pagination runs here on the coordinator (residential IP, no proxy needed).
+    VPS workers handle the actual item scraping in parallel.
+    """
+    settings = Settings()
+
+    async def _get_stores() -> list:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            return await list_stores(pool)
+        finally:
+            await pool.close()
+
+    stores = asyncio.run(_get_stores())
+    if niche:
+        stores = [s for s in stores if s["niche"] == niche]
+
+    if not stores:
+        click.echo("No stores registered. Use 'scraper store add <url> --niche <tag>'")
+        return
 
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
-    total = 0
+    total_queued = 0
 
-    for store_url in store_urls:
-        click.echo(f"Fetching item URLs from {store_url} ...")
+    for s in stores:
+        click.echo(f"  Crawling {s['store_url']} ...")
         item_urls = get_item_urls_from_store(
-            store_url,
-            proxy_url=settings.proxy_url,
+            s["store_url"],
             requests_per_second=settings.requests_per_second,
         )
-        count = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
-        click.echo(f"  {count} new items queued ({len(item_urls) - count} already seen)")
-        total += count
+        queued = enqueue_items(queue, redis_conn, item_urls, niche=s["niche"], store_url=s["store_url"])
+        click.echo(f"    {len(item_urls)} items found, {queued} new jobs queued  [{s['niche']}]")
+        total_queued += queued
 
-    click.echo(f"Done. {total} total items added to queue.")
+    click.echo(f"\nDone. {total_queued} item jobs queued for workers.")
+
+
+@scrape.command("stop")
+def scrape_stop() -> None:
+    """Cancel all pending scrape jobs in the queue.
+
+    In-flight jobs on workers finish normally. Only pending jobs are removed.
+    """
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    queue = get_queue(redis_conn)
+    count = len(queue)
+    queue.empty()
+    click.echo(f"Cleared {count} pending jobs from queue.")
+
+
+@scrape.command("status")
+def scrape_status() -> None:
+    """Show scrape progress: queue depth, scraped counts, and registered stores."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    queue = get_queue(redis_conn)
+
+    async def _run() -> tuple:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            counts = await get_counts(pool)
+            stores = await list_stores(pool)
+        finally:
+            await pool.close()
+        return counts, stores
+
+    counts, stores = asyncio.run(_run())
+    total = sum(counts.values())
+    click.echo(f"Queued jobs:   {len(queue)}")
+    click.echo(f"Total scraped: {total}")
+    if counts:
+        click.echo("\nPer-niche:")
+        for n, c in sorted(counts.items()):
+            click.echo(f"  {n}: {c}")
+    if stores:
+        click.echo(f"\nRegistered stores ({len(stores)}):")
+        for s in stores:
+            click.echo(f"  {s['store_url']}  [{s['niche']}]")
+
+
+# ---------------------------------------------------------------------------
+# proxy
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def proxy() -> None:
+    """Manage the rotating proxy used by all workers."""
+
+
+@proxy.command("set")
+@click.argument("proxy_url")
+def proxy_set(proxy_url: str) -> None:
+    """Set the proxy URL for all workers (takes effect on next job, no restart needed).
+
+    PROXY_URL format: http://user:pass@host:port
+
+    Workers read the proxy from Redis on every job, so this takes effect
+    immediately across all VPS workers without restarting anything.
+
+    Note: use a sticky-session (session-pinned) residential proxy, not a
+    per-request rotating one. Per-request rotation means the eBay homepage
+    warmup and the item page hit different IPs, which can trigger detection.
+    """
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    redis_conn.set(PROXY_REDIS_KEY, proxy_url)
+
+    env_path = _CONFIG_DIR / ".env"
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+        updated = False
+        new_lines = []
+        for line in lines:
+            if line.startswith("PROXY_URL="):
+                new_lines.append(f"PROXY_URL={proxy_url}")
+                updated = True
+            else:
+                new_lines.append(line)
+        if not updated:
+            new_lines.append(f"PROXY_URL={proxy_url}")
+        env_path.write_text("\n".join(new_lines) + "\n")
+
+    click.echo(f"Proxy set: {proxy_url}")
+    click.echo("All workers will use this proxy on their next job.")
+    click.echo("Run 'scraper proxy test' to verify it is working against eBay.")
+
+
+@proxy.command("test")
+@click.option("--item-url", default="https://www.ebay.com/itm/397681222313",
+              help="eBay item URL to test against")
+def proxy_test(item_url: str) -> None:
+    """Test the active proxy against a live eBay item page."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    raw = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw.decode().strip() if raw else settings.proxy_url
+
+    if not proxy_url:
+        click.echo("No proxy configured. Run 'scraper proxy set <url>' first.")
+        return
+
+    masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+    click.echo(f"Testing proxy ...@{masked}")
+    result = scrape_item(item_url, proxy_url=proxy_url)
+    if result:
+        click.echo(f"OK  Proxy working. Scraped: {result.title[:60]}")
+    else:
+        click.echo("FAIL  eBay returned no data (bot challenge or 403).")
+        click.echo("Check the proxy URL and ensure it is a residential proxy.")
+
+
+@proxy.command("status")
+def proxy_status() -> None:
+    """Show the current proxy configuration."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    raw = redis_conn.get(PROXY_REDIS_KEY)
+    redis_proxy = raw.decode().strip() if raw else None
+
+    if redis_proxy:
+        masked = redis_proxy.split("@")[-1] if "@" in redis_proxy else redis_proxy
+        click.echo(f"Active proxy (Redis, used by all workers): ...@{masked}")
+    elif raw is not None:
+        click.echo("Active proxy (Redis): cleared (workers make direct requests)")
+    else:
+        local = settings.proxy_url
+        if local:
+            masked = local.split("@")[-1] if "@" in local else local
+            click.echo(f"Active proxy (local config fallback): ...@{masked}")
+        else:
+            click.echo("No proxy configured.")
+    click.echo("\nUse 'scraper proxy set <url>' to configure.")
+    click.echo("Use 'scraper proxy test' to verify against eBay.")
+
+
+@proxy.command("clear")
+def proxy_clear() -> None:
+    """Remove the proxy. Workers will make direct requests."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    # Store empty string (not delete) so Redis is authoritative over any local config
+    redis_conn.set(PROXY_REDIS_KEY, "")
+
+    env_path = _CONFIG_DIR / ".env"
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+        env_path.write_text("\n".join(
+            "PROXY_URL=" if line.startswith("PROXY_URL=") else line
+            for line in lines
+        ) + "\n")
+
+    click.echo("Proxy cleared. Workers will make direct requests on their next job.")
 
 
 # ---------------------------------------------------------------------------
@@ -416,35 +676,6 @@ def export(output: str, niche: str | None) -> None:
         try:
             count = await export_to_csv(pool, output_path=output, niche=niche)
             click.echo(f"Exported {count} products to {output}")
-        finally:
-            await pool.close()
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# status
-# ---------------------------------------------------------------------------
-
-
-@cli.command()
-def status() -> None:
-    """Show queue depth and per-niche scraped counts."""
-    settings = Settings()
-    redis_conn = get_redis(settings.redis_url)
-    queue = get_queue(redis_conn)
-
-    async def _run() -> None:
-        pool = await asyncpg.create_pool(settings.database_url)
-        try:
-            counts = await get_counts(pool)
-            total = sum(counts.values())
-            click.echo(f"Queued jobs:   {len(queue)}")
-            click.echo(f"Total scraped: {total}")
-            if counts:
-                click.echo("\nPer-niche:")
-                for n, c in sorted(counts.items()):
-                    click.echo(f"  {n}: {c}")
         finally:
             await pool.close()
 
