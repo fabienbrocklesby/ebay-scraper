@@ -89,6 +89,30 @@ def _extract_listing_type(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _fetch_description(soup: BeautifulSoup, client: Any, item_url: str) -> str:
+    """Fetch the item description from eBay's separate description iframe.
+
+    eBay serves item descriptions from itm.ebaydesc.com in an iframe, not in
+    the main page HTML or JSON-LD. The iframe src is in the page and includes
+    session parameters, so we reuse the existing client (with cookies).
+    """
+    iframe = soup.select_one("iframe[src*='ebaydesc.com']")
+    if not iframe:
+        return ""
+    src = iframe.get("src", "")
+    if not src:
+        return ""
+    try:
+        resp = client.get(src, headers={"Referer": item_url})
+        if resp.status_code != 200:
+            return ""
+        desc_soup = BeautifulSoup(resp.text, "html.parser")
+        body = desc_soup.find("body")
+        return body.get_text(separator=" ", strip=True) if body else ""
+    except Exception:
+        return ""
+
+
 def _find_product_ld(soup: BeautifulSoup) -> Optional[dict]:
     """Find the JSON-LD Product block in page HTML.
 
@@ -132,13 +156,15 @@ def scrape_item(
     homepage = f"{parsed.scheme}://{parsed.netloc}/"
     own_client = client is None
 
+    if own_client:
+        from curl_cffi.requests import Session
+        session_kwargs: dict[str, Any] = {"impersonate": "chrome131"}
+        if proxy_url:
+            session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        client = Session(**session_kwargs)
+
     try:
         if own_client:
-            from curl_cffi.requests import Session
-            session_kwargs: dict[str, Any] = {"impersonate": "chrome131"}
-            if proxy_url:
-                session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-            client = Session(**session_kwargs)
             try:
                 client.get(homepage)
             except Exception:
@@ -157,42 +183,43 @@ def scrape_item(
         if response.status_code == 404:
             return None
         response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        ld_json = _find_product_ld(soup)
+        if not ld_json:
+            return None
+
+        offers = ld_json.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+
+        images = ld_json.get("image", [])
+        if isinstance(images, str):
+            images = [images]
+
+        item_specifics = _extract_item_specifics(soup)
+        item_id = _item_id_from_url(item_url)
+        description = _fetch_description(soup, client, item_url)
+
+        return ProductData(
+            item_id=item_id,
+            title=ld_json.get("name", ""),
+            price=float(offers.get("price", 0) or 0),
+            currency=offers.get("priceCurrency", ""),
+            condition=_condition_from_schema(offers.get("itemCondition", "")),
+            description=description,
+            image_urls="|".join(images),
+            item_url=item_url,
+            seller_id=(offers.get("seller") or {}).get("name", ""),
+            category=ld_json.get("category", ""),
+            item_specifics=item_specifics,
+            mpn=_extract_identifier(item_specifics, "MPN", "Manufacturer Part Number", "mpn"),
+            upc=_extract_identifier(item_specifics, "UPC", "EAN", "ISBN", "upc"),
+            shipping=_extract_shipping(soup),
+            listing_type=_extract_listing_type(soup),
+        )
     except Exception:
         return None
     finally:
         if own_client and client:
             client.close()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    ld_json = _find_product_ld(soup)
-    if not ld_json:
-        return None
-
-    offers = ld_json.get("offers", {})
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-
-    images = ld_json.get("image", [])
-    if isinstance(images, str):
-        images = [images]
-
-    item_specifics = _extract_item_specifics(soup)
-    item_id = _item_id_from_url(item_url)
-
-    return ProductData(
-        item_id=item_id,
-        title=ld_json.get("name", ""),
-        price=float(offers.get("price", 0) or 0),
-        currency=offers.get("priceCurrency", ""),
-        condition=_condition_from_schema(offers.get("itemCondition", "")),
-        description=str(ld_json.get("description", "")),
-        image_urls="|".join(images),
-        item_url=item_url,
-        seller_id=(offers.get("seller") or {}).get("name", ""),
-        category=ld_json.get("category", ""),
-        item_specifics=item_specifics,
-        mpn=_extract_identifier(item_specifics, "MPN", "Manufacturer Part Number", "mpn"),
-        upc=_extract_identifier(item_specifics, "UPC", "EAN", "ISBN", "upc"),
-        shipping=_extract_shipping(soup),
-        listing_type=_extract_listing_type(soup),
-    )

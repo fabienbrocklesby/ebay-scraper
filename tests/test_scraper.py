@@ -6,6 +6,8 @@ from scraper.scraper import scrape_item, ProductData
 
 ITEM_URL = "https://www.ebay.com/itm/123456789"
 HOMEPAGE_URL = "https://www.ebay.com/"
+DESC_URL = "https://itm.ebaydesc.com/itmdesc/123456789"
+DESC_HTML = "<html><body>Brand new genuine brake pads. Fits all models.</body></html>"
 
 SAMPLE_HTML = """
 <html>
@@ -14,7 +16,7 @@ SAMPLE_HTML = """
 {
   "@type": "Product",
   "name": "Genuine OEM Toyota Brake Pads",
-  "description": "<p>Brand new genuine brake pads</p>",
+  "description": "",
   "image": [
     "https://i.ebayimg.com/images/g/abc/s-l1600.jpg",
     "https://i.ebayimg.com/images/g/def/s-l1600.jpg"
@@ -37,6 +39,7 @@ SAMPLE_HTML = """
     <dt>Part Number</dt><dd>04465-33130</dd>
   </dl>
 </div>
+<iframe src="https://itm.ebaydesc.com/itmdesc/123456789"></iframe>
 <span class="ux-textspans--BOLD">Free shipping</span>
 <span class="ux-textspans">Buy It Now</span>
 </body>
@@ -50,7 +53,7 @@ AU_ARRAY_HTML = """
 [
   {"@type": "Product",
    "name": "AU Product",
-   "description": "A product",
+   "description": "",
    "image": ["https://i.ebayimg.com/au.jpg"],
    "offers": {"@type": "Offer", "price": "99.00", "priceCurrency": "AUD",
                "itemCondition": "https://schema.org/NewCondition",
@@ -61,7 +64,7 @@ AU_ARRAY_HTML = """
 ]
 </script>
 </head>
-<body></body>
+<body><iframe src="https://itm.ebaydesc.com/itmdesc/399000000001"></iframe></body>
 </html>
 """
 
@@ -69,6 +72,7 @@ AU_ARRAY_HTML = """
 @respx.mock
 def test_scrape_item_returns_product_data():
     respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(ITEM_URL, client=client)
     assert isinstance(product, ProductData)
@@ -83,8 +87,28 @@ def test_scrape_item_returns_product_data():
 
 
 @respx.mock
+def test_scrape_item_description_fetched_from_iframe():
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
+    client = httpx.Client(follow_redirects=True)
+    product = scrape_item(ITEM_URL, client=client)
+    assert "genuine brake pads" in product.description.lower()
+
+
+@respx.mock
+def test_scrape_item_description_empty_on_iframe_failure():
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(503, text=""))
+    client = httpx.Client(follow_redirects=True)
+    product = scrape_item(ITEM_URL, client=client)
+    assert product is not None
+    assert product.description == ""
+
+
+@respx.mock
 def test_scrape_item_image_urls_pipe_separated():
     respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(ITEM_URL, client=client)
     urls = product.image_urls.split("|")
@@ -104,6 +128,7 @@ def test_scrape_item_returns_none_on_404():
 @respx.mock
 def test_scrape_item_item_specifics_json():
     respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(ITEM_URL, client=client)
     specifics = json.loads(product.item_specifics)
@@ -114,6 +139,7 @@ def test_scrape_item_item_specifics_json():
 @respx.mock
 def test_scrape_item_shipping_and_listing_type():
     respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(ITEM_URL, client=client)
     assert "free" in product.shipping.lower()
@@ -124,7 +150,9 @@ def test_scrape_item_shipping_and_listing_type():
 def test_scrape_item_handles_jsonld_array():
     """JSON-LD on ebay.com.au wraps product data in an array, not a top-level dict."""
     au_url = "https://www.ebay.com.au/itm/399000000001"
+    au_desc_url = "https://itm.ebaydesc.com/itmdesc/399000000001"
     respx.get(au_url).mock(return_value=httpx.Response(200, text=AU_ARRAY_HTML))
+    respx.get(au_desc_url).mock(return_value=httpx.Response(200, text=DESC_HTML))
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(au_url, client=client)
     assert product is not None
