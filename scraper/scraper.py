@@ -1,17 +1,26 @@
 import json
+import re
+import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -32,6 +41,13 @@ class ProductData:
     upc: str
     shipping: str
     listing_type: str
+
+
+def _item_id_from_url(item_url: str) -> str:
+    m = re.search(r"/itm/(\d+)", item_url)
+    if not m:
+        raise ValueError(f"Cannot extract item ID from URL: {item_url}")
+    return m.group(1)
 
 
 def _condition_from_schema(schema_url: str) -> str:
@@ -89,21 +105,70 @@ def _extract_listing_type(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _find_product_ld(soup: BeautifulSoup) -> Optional[dict]:
+    """Find the JSON-LD Product block in page HTML.
+
+    eBay embeds product data as JSON-LD. The block may be a top-level dict
+    or inside an array (observed on ebay.com.au). Both forms are handled here.
+    """
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+        if isinstance(data, dict) and data.get("@type") == "Product":
+            return data
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("@type") == "Product":
+                    return item
+    return None
+
+
 def scrape_item(
-    item_id: str,
+    item_url: str,
     proxy_url: Optional[str] = None,
     client: Optional[httpx.Client] = None,
 ) -> Optional[ProductData]:
-    url = f"https://www.ebay.com/itm/{item_id}"
+    """Fetch an eBay item page and return structured product data, or None on failure.
+
+    Accepts a full item URL (e.g. https://www.ebay.com.au/itm/123456789) so that
+    non-US eBay domains are handled correctly.
+
+    When no client is provided, warms a fresh session by visiting the eBay homepage
+    first. This establishes cookies required to bypass eBay's bot detection on item
+    detail pages.
+    """
+    parsed = urlparse(item_url)
+    homepage = f"{parsed.scheme}://{parsed.netloc}/"
     own_client = client is None
 
     try:
         if own_client:
-            client_kwargs: dict = {"headers": HEADERS, "timeout": 30}
+            client_kwargs: dict = {
+                "headers": HEADERS,
+                "timeout": 30,
+                "follow_redirects": True,
+            }
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             client = httpx.Client(**client_kwargs)
-        response = client.get(url)
+            try:
+                client.get(homepage)
+            except httpx.HTTPError:
+                pass
+            time.sleep(1.0)
+
+        response = client.get(
+            item_url,
+            headers={
+                "Referer": homepage,
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+            },
+        )
         if response.status_code == 404:
             return None
         response.raise_for_status()
@@ -114,35 +179,30 @@ def scrape_item(
             client.close()
 
     soup = BeautifulSoup(response.text, "html.parser")
-    ld_json = None
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-            if isinstance(data, dict) and data.get("@type") == "Product":
-                ld_json = data
-                break
-        except (json.JSONDecodeError, AttributeError):
-            continue
-
+    ld_json = _find_product_ld(soup)
     if not ld_json:
         return None
 
     offers = ld_json.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+
     images = ld_json.get("image", [])
     if isinstance(images, str):
         images = [images]
 
     item_specifics = _extract_item_specifics(soup)
+    item_id = _item_id_from_url(item_url)
 
     return ProductData(
         item_id=item_id,
         title=ld_json.get("name", ""),
-        price=float(offers.get("price", 0)),
+        price=float(offers.get("price", 0) or 0),
         currency=offers.get("priceCurrency", ""),
         condition=_condition_from_schema(offers.get("itemCondition", "")),
         description=str(ld_json.get("description", "")),
         image_urls="|".join(images),
-        item_url=url,
+        item_url=item_url,
         seller_id=(offers.get("seller") or {}).get("name", ""),
         category=ld_json.get("category", ""),
         item_specifics=item_specifics,

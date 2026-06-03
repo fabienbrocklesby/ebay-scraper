@@ -1,7 +1,11 @@
+import json
 import pytest
 import respx
 import httpx
 from scraper.scraper import scrape_item, ProductData
+
+ITEM_URL = "https://www.ebay.com/itm/123456789"
+HOMEPAGE_URL = "https://www.ebay.com/"
 
 SAMPLE_HTML = """
 <html>
@@ -39,13 +43,34 @@ SAMPLE_HTML = """
 </html>
 """
 
+AU_ARRAY_HTML = """
+<html>
+<head>
+<script type="application/ld+json">
+[
+  {"@type": "Product",
+   "name": "AU Product",
+   "description": "A product",
+   "image": ["https://i.ebayimg.com/au.jpg"],
+   "offers": {"@type": "Offer", "price": "99.00", "priceCurrency": "AUD",
+               "itemCondition": "https://schema.org/NewCondition",
+               "seller": {"@type": "Person", "name": "auseller"}},
+   "category": "Parts"
+  },
+  {"@type": "VideoObject"}
+]
+</script>
+</head>
+<body></body>
+</html>
+"""
+
 
 @respx.mock
 def test_scrape_item_returns_product_data():
-    respx.get("https://www.ebay.com/itm/123456789").mock(
-        return_value=httpx.Response(200, text=SAMPLE_HTML)
-    )
-    product = scrape_item("123456789")
+    respx.get(HOMEPAGE_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    product = scrape_item(ITEM_URL)
     assert isinstance(product, ProductData)
     assert product.item_id == "123456789"
     assert product.title == "Genuine OEM Toyota Brake Pads"
@@ -54,14 +79,14 @@ def test_scrape_item_returns_product_data():
     assert product.condition == "New"
     assert product.seller_id == "autopartsking"
     assert product.category == "Auto Parts"
+    assert product.item_url == ITEM_URL
 
 
 @respx.mock
 def test_scrape_item_image_urls_pipe_separated():
-    respx.get("https://www.ebay.com/itm/999999999").mock(
-        return_value=httpx.Response(200, text=SAMPLE_HTML)
-    )
-    product = scrape_item("999999999")
+    respx.get(HOMEPAGE_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    product = scrape_item(ITEM_URL)
     urls = product.image_urls.split("|")
     assert len(urls) == 2
     assert all("ebayimg.com" in u for u in urls)
@@ -69,20 +94,18 @@ def test_scrape_item_image_urls_pipe_separated():
 
 @respx.mock
 def test_scrape_item_returns_none_on_404():
-    respx.get("https://www.ebay.com/itm/000000000").mock(
-        return_value=httpx.Response(404, text="Not Found")
-    )
-    result = scrape_item("000000000")
+    url_404 = "https://www.ebay.com/itm/000000000"
+    respx.get(HOMEPAGE_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(url_404).mock(return_value=httpx.Response(404, text="Not Found"))
+    result = scrape_item(url_404)
     assert result is None
 
 
 @respx.mock
 def test_scrape_item_item_specifics_json():
-    respx.get("https://www.ebay.com/itm/123456789").mock(
-        return_value=httpx.Response(200, text=SAMPLE_HTML)
-    )
-    import json
-    product = scrape_item("123456789")
+    respx.get(HOMEPAGE_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    product = scrape_item(ITEM_URL)
     specifics = json.loads(product.item_specifics)
     assert specifics.get("Brand") == "Toyota"
     assert specifics.get("Part Number") == "04465-33130"
@@ -90,9 +113,22 @@ def test_scrape_item_item_specifics_json():
 
 @respx.mock
 def test_scrape_item_shipping_and_listing_type():
-    respx.get("https://www.ebay.com/itm/123456789").mock(
-        return_value=httpx.Response(200, text=SAMPLE_HTML)
-    )
-    product = scrape_item("123456789")
+    respx.get(HOMEPAGE_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=SAMPLE_HTML))
+    product = scrape_item(ITEM_URL)
     assert "free" in product.shipping.lower()
     assert product.listing_type == "Buy It Now"
+
+
+@respx.mock
+def test_scrape_item_handles_jsonld_array():
+    """JSON-LD on ebay.com.au wraps product data in an array, not a top-level dict."""
+    au_url = "https://www.ebay.com.au/itm/399000000001"
+    au_home = "https://www.ebay.com.au/"
+    respx.get(au_home).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(au_url).mock(return_value=httpx.Response(200, text=AU_ARRAY_HTML))
+    product = scrape_item(au_url)
+    assert product is not None
+    assert product.title == "AU Product"
+    assert product.currency == "AUD"
+    assert product.item_id == "399000000001"

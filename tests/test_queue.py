@@ -13,8 +13,13 @@ def make_mock_redis(already_queued: set = None):
 def test_enqueue_items_enqueues_all_new():
     mock_redis = make_mock_redis()
     mock_queue = MagicMock()
+    item_urls = [
+        "https://www.ebay.com/itm/111",
+        "https://www.ebay.com/itm/222",
+        "https://www.ebay.com/itm/333",
+    ]
     count = enqueue_items(
-        mock_queue, mock_redis, ["111", "222", "333"],
+        mock_queue, mock_redis, item_urls,
         niche="test", store_url="https://www.ebay.com/str/s"
     )
     assert mock_queue.enqueue.call_count == 3
@@ -22,10 +27,15 @@ def test_enqueue_items_enqueues_all_new():
 
 
 def test_enqueue_items_skips_already_queued():
+    # item_id "111" is already in the set
     mock_redis = make_mock_redis(already_queued={"111"})
     mock_queue = MagicMock()
+    item_urls = [
+        "https://www.ebay.com/itm/111",
+        "https://www.ebay.com/itm/222",
+    ]
     count = enqueue_items(
-        mock_queue, mock_redis, ["111", "222"],
+        mock_queue, mock_redis, item_urls,
         niche="test", store_url="https://www.ebay.com/str/s"
     )
     assert mock_queue.enqueue.call_count == 1

@@ -1,0 +1,8 @@
+pyproject.toml
+ebay_scraper.egg-info/PKG-INFO
+ebay_scraper.egg-info/SOURCES.txt
+ebay_scraper.egg-info/dependency_links.txt
+ebay_scraper.egg-info/entry_points.txt
+ebay_scraper.egg-info/requires.txt
+ebay_scraper.egg-info/top_level.txt
+scraper/__init__.py

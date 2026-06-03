@@ -23,15 +23,18 @@ INSERT_SQL = """
 """
 
 
-def scrape_and_store(item_id: str, niche: str, store_url: str) -> None:
+def scrape_and_store(item_url: str, niche: str, store_url: str) -> None:
     """Scrape a single eBay item and persist it to Postgres.
+
+    Accepts the full item URL (e.g. https://www.ebay.com.au/itm/123) so the
+    correct eBay domain is used for non-US stores.
 
     Intended to be enqueued as an rq job. Uses psycopg2 (sync) deliberately:
     rq worker processes are synchronous, and mixing asyncpg into a sync context
     would require creating a new event loop per job, which is fragile.
     """
     settings = Settings()
-    product: Optional[ProductData] = scrape_item(item_id, proxy_url=settings.proxy_url)
+    product: Optional[ProductData] = scrape_item(item_url, proxy_url=settings.proxy_url)
     if product is None:
         return
 

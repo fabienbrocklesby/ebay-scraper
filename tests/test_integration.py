@@ -38,11 +38,11 @@ def test_scrape_and_store_full_flow(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", TEST_DB_URL)
     monkeypatch.setenv("PROXY_URL", "")
 
-    respx.get("https://www.ebay.com/itm/777777777").mock(
-        return_value=httpx.Response(200, text=ITEM_HTML)
-    )
+    item_url = "https://www.ebay.com/itm/777777777"
+    respx.get("https://www.ebay.com/").mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get(item_url).mock(return_value=httpx.Response(200, text=ITEM_HTML))
 
-    scrape_and_store("777777777", "integration-test", "https://www.ebay.com/str/teststore")
+    scrape_and_store(item_url, "integration-test", "https://www.ebay.com/str/teststore")
 
     async def check():
         pool = await asyncpg.create_pool(TEST_DB_URL)

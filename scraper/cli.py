@@ -7,7 +7,7 @@ from scraper.config import Settings
 from scraper.db import clear_niche, get_counts, init_schema
 from scraper.export import export_to_csv
 from scraper.queue import enqueue_items, get_queue, get_redis
-from scraper.store import get_item_ids_from_store
+from scraper.store import get_item_urls_from_store
 from scraper.worker import start_worker
 
 
@@ -34,14 +34,14 @@ def add(source: str, niche: str) -> None:
     total = 0
 
     for store_url in store_urls:
-        click.echo(f"Fetching item IDs from {store_url} ...")
-        item_ids = get_item_ids_from_store(
+        click.echo(f"Fetching item URLs from {store_url} ...")
+        item_urls = get_item_urls_from_store(
             store_url,
             proxy_url=settings.proxy_url,
             requests_per_second=settings.requests_per_second,
         )
-        count = enqueue_items(queue, redis_conn, item_ids, niche=niche, store_url=store_url)
-        click.echo(f"  {count} new items queued ({len(item_ids) - count} already seen)")
+        count = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
+        click.echo(f"  {count} new items queued ({len(item_urls) - count} already seen)")
         total += count
 
     click.echo(f"Done. {total} total items added to queue.")

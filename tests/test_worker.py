@@ -23,6 +23,9 @@ def make_mock_product():
     )
 
 
+ITEM_URL = "https://www.ebay.com/itm/123"
+
+
 def test_scrape_and_store_inserts_on_success(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
     monkeypatch.setenv("DATABASE_URL", "postgresql://scraper:scraper@localhost/ebayscraper")
@@ -39,7 +42,7 @@ def test_scrape_and_store_inserts_on_success(monkeypatch):
     with patch("scraper.worker.scrape_item", return_value=make_mock_product()), \
          patch("scraper.worker.psycopg2.connect", return_value=mock_conn):
         from scraper.worker import scrape_and_store
-        scrape_and_store("123", "electronics", "https://www.ebay.com/str/test")
+        scrape_and_store(ITEM_URL, "electronics", "https://www.ebay.com/str/test")
         assert mock_cursor.execute.called
         assert mock_conn.commit.called
 
@@ -54,5 +57,5 @@ def test_scrape_and_store_skips_on_none_result(monkeypatch):
     with patch("scraper.worker.scrape_item", return_value=None), \
          patch("scraper.worker.psycopg2.connect", return_value=mock_conn):
         from scraper.worker import scrape_and_store
-        scrape_and_store("000", "electronics", "https://www.ebay.com/str/test")
+        scrape_and_store("https://www.ebay.com/itm/000", "electronics", "https://www.ebay.com/str/test")
         assert not mock_conn.commit.called

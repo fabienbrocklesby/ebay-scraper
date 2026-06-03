@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: ebay-scraper
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: httpx>=0.27
+Requires-Dist: beautifulsoup4>=4.12
+Requires-Dist: rq>=1.16
+Requires-Dist: asyncpg>=0.29
+Requires-Dist: psycopg2-binary>=2.9
+Requires-Dist: click>=8.1
+Requires-Dist: python-dotenv>=1.0

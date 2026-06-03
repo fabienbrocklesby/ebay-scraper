@@ -1,0 +1,2 @@
+[console_scripts]
+scraper = scraper.cli:cli
