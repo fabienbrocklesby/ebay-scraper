@@ -538,13 +538,90 @@ def scrape() -> None:
     """Control scraping (start, stop, status)."""
 
 
+_FAILED_STORES_FILE = Path.home() / ".config" / "ebay-scraper" / "failed_stores.txt"
+
+
+def _discover_store(store_url: str, proxy_url: str | None, rps: float) -> tuple[str, list[str]]:
+    """Find a store's item URLs. Proxy first, then the coordinator's own IP.
+
+    eBay serves most stores fine through the rotating proxy (~80% in testing), but
+    detects the proxy for a minority of stores and serves a degraded "0 results"
+    storefront to every proxy exit IP. The coordinator's genuine ISP IP gets the
+    real grid for those, so when the proxy returns 0 (or is challenged) we retry
+    once directly. Doing the proxy first keeps the bulk of the load off the
+    coordinator IP, so it stays unflagged for the minority that actually need it.
+    A direct 0 (genuine IP) is trusted as a truly empty store. Returns
+    (outcome, urls) with outcome in "ok", "empty", or "blocked".
+    """
+    if proxy_url:
+        try:
+            urls = get_item_urls_from_store(store_url, proxy_url=proxy_url, requests_per_second=rps)
+            if urls:
+                return ("ok", urls)
+        except ChallengeError:
+            pass
+    try:
+        urls = get_item_urls_from_store(store_url, proxy_url=None, requests_per_second=rps)
+        return ("ok", urls) if urls else ("empty", [])
+    except ChallengeError:
+        return ("blocked", [])
+
+
+def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
+    _FAILED_STORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _FAILED_STORES_FILE.write_text("".join(f"{url},{niche}\n" for url, niche in failures))
+
+
+def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, settings: "Settings"):
+    """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, total_queued)."""
+    redis_conn = get_redis(settings.redis_url)
+    queue = get_queue(redis_conn)
+    ok: list[str] = []
+    empty: list[tuple[str, str]] = []
+    blocked: list[tuple[str, str]] = []
+    total_queued = 0
+    for store_url, niche in stores:
+        click.echo(f"  Crawling {store_url} ...")
+        outcome, item_urls = _discover_store(store_url, proxy_url, settings.requests_per_second)
+        if outcome == "ok":
+            queued = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
+            total_queued += queued
+            ok.append(store_url)
+            click.echo(f"    OK: {len(item_urls)} items, {queued} new jobs queued  [{niche}]")
+        elif outcome == "empty":
+            empty.append((store_url, niche))
+            click.echo(f"    0 results (empty store, or this IP was served a degraded view)  [{niche}]")
+        else:
+            blocked.append((store_url, niche))
+            click.echo(f"    BLOCKED by eBay  [{niche}]", err=True)
+    return ok, empty, blocked, total_queued
+
+
+def _report_discovery(ok, empty, blocked, total_queued: int) -> None:
+    click.echo(
+        f"\nDone. {len(ok)} stores OK, {len(empty)} returned 0 results, "
+        f"{len(blocked)} blocked. {total_queued} item jobs queued for workers."
+    )
+    failures = empty + blocked
+    if failures:
+        _write_failed_stores(failures)
+        click.echo(
+            f"\n{len(failures)} store(s) returned nothing this pass and were saved to "
+            f"{_FAILED_STORES_FILE}.\nThis is usually a flagged proxy IP or a hot "
+            f"coordinator IP, not a real empty store. Re-run them later (a different "
+            f"time gets fresh IPs) with:\n  scraper scrape retry"
+        )
+
+
 @scrape.command("start")
 @click.option("--niche", default=None, help="Only scrape stores with this niche tag")
 def scrape_start(niche: str | None) -> None:
     """Paginate all registered stores and queue item scrape jobs for VPS workers.
 
-    Store pagination runs here on the coordinator (residential IP, no proxy needed).
-    VPS workers handle the actual item scraping in parallel.
+    Store pagination runs here on the coordinator using its own (clean) IP, which
+    eBay serves the real item grid, falling back to the proxy only if that IP is
+    challenged. Every store is reported as OK / 0-results / blocked, and anything
+    that returned nothing is saved for 'scraper scrape retry'.
     """
     settings = Settings()
 
@@ -555,52 +632,48 @@ def scrape_start(niche: str | None) -> None:
         finally:
             await pool.close()
 
-    stores = asyncio.run(_get_stores())
+    rows = asyncio.run(_get_stores())
     if niche:
-        stores = [s for s in stores if s["niche"] == niche]
-
-    if not stores:
+        rows = [s for s in rows if s["niche"] == niche]
+    if not rows:
         click.echo("No stores registered. Use 'scraper store add <url> --niche <tag>'")
         return
 
     redis_conn = get_redis(settings.redis_url)
-    queue = get_queue(redis_conn)
-
     raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
     proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
     proxy_url = proxy_url or None
 
-    total_queued = 0
-    blocked: list[str] = []
+    stores = [(s["store_url"], s["niche"]) for s in rows]
+    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
+    _report_discovery(ok, empty, blocked, total_queued)
 
-    for s in stores:
-        click.echo(f"  Crawling {s['store_url']} ...")
-        try:
-            item_urls = get_item_urls_from_store(
-                s["store_url"],
-                proxy_url=proxy_url,
-                requests_per_second=settings.requests_per_second,
-            )
-        except ChallengeError as exc:
-            blocked.append(s["store_url"])
-            click.echo(f"    BLOCKED: {exc}", err=True)
-            continue
-        queued = enqueue_items(queue, redis_conn, item_urls, niche=s["niche"], store_url=s["store_url"])
-        click.echo(f"    {len(item_urls)} items found, {queued} new jobs queued  [{s['niche']}]")
-        total_queued += queued
 
-    click.echo(f"\nDone. {total_queued} item jobs queued for workers.")
-    if blocked:
-        click.echo(
-            f"\n{len(blocked)} store(s) were blocked by eBay before the crawl "
-            f"completed and were NOT fully queued:", err=True,
-        )
-        for url in blocked:
-            click.echo(f"  - {url}", err=True)
-        click.echo(
-            "Set a rotating residential proxy (scraper proxy set <url>) and "
-            "re-run 'scraper scrape start' to finish them.", err=True,
-        )
+@scrape.command("retry")
+def scrape_retry() -> None:
+    """Re-run discovery for stores that returned 0 results or were blocked last time.
+
+    Reads the failure list written by 'scrape start' and tries each store again
+    (fresh IPs at a different time recover most of them). Stores that succeed are
+    queued and dropped from the list; the rest stay for the next retry.
+    """
+    settings = Settings()
+    if not _FAILED_STORES_FILE.exists() or not _FAILED_STORES_FILE.read_text().strip():
+        click.echo("No failed stores recorded. Nothing to retry.")
+        return
+    stores = _parse_store_lines(_FAILED_STORES_FILE.read_text(), None)
+
+    redis_conn = get_redis(settings.redis_url)
+    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
+    proxy_url = proxy_url or None
+
+    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
+    _write_failed_stores(empty + blocked)
+    click.echo(
+        f"\nRetry done. {len(ok)} recovered, {len(empty) + len(blocked)} still "
+        f"failing (kept in {_FAILED_STORES_FILE}). {total_queued} item jobs queued."
+    )
 
 
 @scrape.command("delta")
