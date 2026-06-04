@@ -66,8 +66,12 @@ Placeholders used below (fill in your own values):
 
 ## 3. Coordinator setup (your PC, one time)
 
-Works on macOS, Linux, or Windows (use PowerShell on Windows). You need **Docker**,
-**Python 3.11+**, **git**, and **Tailscale** installed first.
+Tested end to end on **macOS and Linux**. Windows should work with Docker Desktop,
+Python, git and Tailscale installed (run the same `scraper ...` commands in
+PowerShell), but it was not tested, so prefer macOS or Linux for the coordinator if
+you can. You need **Docker**, **Python 3.11+ (with pip)**, **git**, and
+**Tailscale** installed first. On a fresh Linux box:
+`apt update && apt install -y python3-pip git docker.io`.
 
 ```bash
 # 1. Install Tailscale and sign in, then confirm you have an IP:
