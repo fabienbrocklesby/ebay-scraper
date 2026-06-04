@@ -6,9 +6,19 @@ A distributed eBay product scraper built for Kieran Granger. Scrapes full produc
 
 ## Status
 
-**Implemented and validated against live eBay.** All modules in `scraper/` exist with passing tests (`pytest`, 47 tests). The full CLI chain (coordinator services, store add, scrape start, worker, export) has been run end to end. See `README.md` for the user-facing setup and usage guide.
+**Implemented and validated against live eBay, including a real VPS + coordinator + proxy run.** All modules in `scraper/` exist with passing tests (`pytest`, 78 tests). The full chain (coordinator services, store add, scrape start, batched worker, delta, export) has been run end to end on real infra. See `README.md` for the user-facing setup and usage guide.
 
-Key hard-won behaviour to preserve: eBay serves bot-challenge pages with **HTTP 200** (titles "Security Measure" and "Pardon Our Interruption"). These are detected in `scraper/fetch.py` (`is_challenge_page`) and must never be read as "no more data" - doing so silently truncates store crawls and drops items. On a challenge the store crawl raises `ChallengeError` (loud, with a partial count) and item jobs raise so rq retries them. Workers and large-store crawls require a **rotating residential proxy**; a single static IP is blocked by eBay after ~20-40 requests.
+The throughput/cost redesign is captured in `docs/superpowers/specs/2026-06-04-ebay-scraper-scale-redesign.md` and `docs/superpowers/plans/2026-06-04-ebay-scraper-scale-redesign.md`. What changed from the original per-item design:
+
+- **Batched concurrent worker.** The queue job is now `scrape_batch` (a batch of ~200 item URLs fetched concurrently with a thread pool, then bulk-upserted), not one item per job. One rq worker process per box; a per-IP `TokenBucket` (`scraper/throttle.py`) is the only rate limiter. Scale by adding boxes. Knobs: `WORKER_CONCURRENCY`, `MAX_RPS_PER_IP`, `BATCH_SIZE`.
+- **Delta mode.** `scraper scrape delta` re-reads cheap listing pages and only re-fetches new or price-changed items (`scraper/delta.py`, `compute_delta`). Backfill once with `scrape start`, then delta on a schedule.
+- **Topology decides cost (measured live).** A **residential-IP** worker fetches eBay directly for free (cheap path, millions/day via more boxes / higher `MAX_RPS_PER_IP`). A **datacenter/VPS** IP gets a hard **403** and must fetch through the residential proxy, paying bandwidth (~0.8-1 MB/item). The worker tries its own IP first and escalates to the proxy on a block (`BoxProxyState`), so one build runs both ways.
+
+Key hard-won behaviour to preserve:
+
+- eBay serves bot-challenge pages with **HTTP 200** (titles "Security Measure" and "Pardon Our Interruption"), detected in `scraper/fetch.py` (`is_challenge_page`); a **403** is also a block. Neither may be read as "no more data": that silently truncates crawls and drops items. Store crawls raise `ChallengeError` (loud, with a partial count); item fetches raise so the batch requeues/escalates.
+- **A cold session gets 403 even from a residential IP.** `scrape_item`'s own-client path warms via a homepage GET; the batched worker injects a **warmed, reused** per-thread session (`_warmed_session`) to skip the per-item warmup+sleep while still carrying cookies. Do not "optimize" the warmup away.
+- On macOS, rq's per-job fork aborts under Objective-C fork-safety; `start_worker` sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` on darwin. Production workers run on Linux (Docker) and are unaffected.
 
 ## Implementation Plan
 
