@@ -12,7 +12,7 @@ The throughput/cost redesign is captured in `docs/superpowers/specs/2026-06-04-e
 
 - **Batched concurrent worker.** The queue job is now `scrape_batch` (a batch of ~200 item URLs fetched concurrently with a thread pool, then bulk-upserted), not one item per job. One rq worker process per box; a per-IP `TokenBucket` (`scraper/throttle.py`) is the only rate limiter. Scale by adding boxes. Knobs: `WORKER_CONCURRENCY`, `MAX_RPS_PER_IP`, `BATCH_SIZE`.
 - **Delta mode.** `scraper scrape delta` re-reads cheap listing pages and only re-fetches new or price-changed items (`scraper/delta.py`, `compute_delta`). Backfill once with `scrape start`, then delta on a schedule.
-- **Topology decides cost (measured live).** A **residential-IP** worker fetches eBay directly for free (cheap path, millions/day via more boxes / higher `MAX_RPS_PER_IP`). A **datacenter/VPS** IP gets a hard **403** and must fetch through the residential proxy, paying bandwidth (~0.8-1 MB/item). The worker tries its own IP first and escalates to the proxy on a block (`BoxProxyState`), so one build runs both ways.
+- **Topology decides cost (measured live).** A **residential-IP** worker fetches eBay directly for free. But one IP has a reputation ceiling: a soak ran clean for ~3,500 back-to-back fetches at ~8/sec, then eBay started challenging it. So millions/day = **more residential boxes** at a modest `MAX_RPS_PER_IP`, not hammering one IP. A **datacenter/VPS** IP gets a hard **403** and must fetch through the residential proxy, paying bandwidth (~0.8-1 MB/item). The worker tries its own IP first and escalates to the proxy on a block (`BoxProxyState`), so one build runs both ways.
 
 Key hard-won behaviour to preserve:
 

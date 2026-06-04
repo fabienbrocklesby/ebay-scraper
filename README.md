@@ -38,8 +38,14 @@ This was measured against live eBay, and it matters a lot:
   residential-IP box): eBay serves it directly. No proxy, **no per-GB bandwidth
   cost**, fast. This is the cheap path and the way to do millions/day without
   spending much. It is what Kieran's original home-PC script was already doing,
-  just scaled up. Measured: ~6-7 items/sec per box at the safe default rate
-  (~550k/day/box), tunable higher, free.
+  just scaled up. Measured: ~6-8 items/sec per box. **But one IP has a reputation
+  ceiling**: in a live soak a single residential IP ran clean for ~3,500
+  back-to-back fetches at ~8/sec, then eBay started challenging it. So you do not
+  get unlimited free throughput from one IP, you get it from **many** IPs. Reach
+  millions/day by running several residential boxes (and/or lowering
+  `MAX_RPS_PER_IP` so each IP stays under the challenge threshold). When an IP
+  does get hot, the worker auto-falls back to the proxy for a cooldown, so data
+  keeps flowing.
 - **Worker on a datacenter/VPS IP** (Hetzner, DigitalOcean, Vultr, etc.): eBay
   blocks those IPs with a 403, so the worker must fetch through a **rotating
   residential proxy**, and every ~0.8 MB detail page then costs proxy bandwidth.
@@ -558,15 +564,20 @@ pipx reinstall ebay-scraper
   exposing items after roughly 10,000 per store. For stores bigger than that you
   cannot get every single item through pagination — that is an eBay limit, not a
   bug here. Most seller stores are well under it.
-- **Throughput scales with worker boxes.** Each box runs at its `MAX_RPS_PER_IP`
-  cap (default 6 items/sec ≈ 550k/day). Add boxes, or raise the cap on a
-  residential box, to reach millions/day. Measured live on a residential IP:
-  ~6-8 items/sec/box, 200/200 items per batch, and a soak of 2,000+ consecutive
-  detail fetches from a single residential IP at ~8/sec with **zero** blocks.
-  Caveat for the first big run: that soak covers minutes, not a multi-hour
-  backfill, so watch the block rate on your first long backfill; if a single IP
-  starts getting challenged at high sustained volume, lower `MAX_RPS_PER_IP` or
-  add more residential boxes (the worker also auto-falls back to the proxy).
+- **Throughput scales with the number of worker boxes, not with hammering one
+  IP.** Each box runs at its `MAX_RPS_PER_IP` cap (default 6 items/sec). A live
+  soak showed the real per-IP limit: a single residential IP fetched ~3,500 items
+  back-to-back at ~8/sec with zero blocks, then eBay's per-IP reputation tripped
+  and it began challenging (≈75% of requests in the next batch). Takeaways:
+    - For a sustained backfill, keep `MAX_RPS_PER_IP` modest and **scale by adding
+      residential boxes**, that is how you reach millions/day cheaply.
+    - A single box pushed hard will get its IP challenged after a few thousand
+      fast requests. That is eBay's reputation system, not a bug. When it happens
+      the worker auto-falls back to the proxy for `CHALLENGE_COOLDOWN_SECONDS`
+      then probes direct again, so the backfill continues (paying proxy bandwidth
+      only while the IP is hot).
+    - Watch the first long backfill and tune `MAX_RPS_PER_IP` down if you see a
+      box leaning on the proxy a lot.
 - **Cost depends on worker IP type, not on the tool.** On residential-IP boxes
   the detail fetches are direct and free, so a large one-time backfill costs
   essentially nothing but time. On datacenter/VPS boxes the same fetches go
