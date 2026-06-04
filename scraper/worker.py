@@ -1,6 +1,8 @@
 import psycopg2
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 from psycopg2.extras import execute_values
 
@@ -79,19 +81,49 @@ def _bulk_upsert(database_url: str, products: list[ProductData], niche: str, sto
         conn.close()
 
 
+_session_local = threading.local()
+
+
+def _warmed_session(proxy_url: str | None, item_url: str) -> Any:
+    """Return a per-thread curl_cffi session, warmed once against the eBay homepage.
+
+    eBay serves a 403 to a cold session that carries no cookies. scrape_item's own
+    client path warms via a homepage GET, but the batched worker injects its own
+    session to skip the per-item warmup and 1s sleep, so it must warm the session
+    itself. The warmed session is cached per (proxy, host) on the worker thread and
+    reused for every item, so the homepage cost is paid once per thread, not per item.
+    """
+    cache = getattr(_session_local, "sessions", None)
+    if cache is None:
+        cache = {}
+        _session_local.sessions = cache
+    host = urlparse(item_url).netloc
+    key = (proxy_url or "", host)
+    session = cache.get(key)
+    if session is None:
+        session = build_session(apply_proxy_country(proxy_url, item_url))
+        try:
+            session.get(f"https://{host}/", timeout=30)
+        except Exception:
+            pass
+        cache[key] = session
+    return session
+
+
 def _scrape_one(item_url: str, residential_proxy: str | None, box_state: BoxProxyState, bucket: TokenBucket) -> Optional[ProductData]:
     """Fetch one item. Box IP first; on challenge or wrong country, retry via residential.
 
-    A curl_cffi session is built and injected per attempt, which makes scrape_item
-    skip its homepage warmup and 1s sleep (those only run on its own-client path).
-    The TokenBucket is therefore the only rate governor. Raises if the residential
-    retry also fails so the caller can mark the item failed.
+    A warmed per-thread session is injected, which makes scrape_item skip its own
+    homepage warmup and 1s sleep, so the TokenBucket is the only rate governor. A
+    datacenter box IP works once the session is warmed; if eBay still blocks it
+    (403 or challenge), that raises and we retry via the residential proxy. Raises
+    if the residential retry also fails so the caller can mark the item failed.
     """
     bucket.acquire()
     use_residential = bool(box_state.should_use_residential() and residential_proxy)
     proxy = residential_proxy if use_residential else None
     try:
-        session = build_session(apply_proxy_country(proxy, item_url))
+        session = _warmed_session(proxy, item_url)
         data = scrape_item(item_url, proxy_url=proxy, client=session)
         box_state.record(challenged=False)
         return data
@@ -99,7 +131,7 @@ def _scrape_one(item_url: str, residential_proxy: str | None, box_state: BoxProx
         box_state.record(challenged=True)
         if residential_proxy and not use_residential:
             bucket.acquire()
-            session = build_session(apply_proxy_country(residential_proxy, item_url))
+            session = _warmed_session(residential_proxy, item_url)
             return scrape_item(item_url, proxy_url=residential_proxy, client=session)
         raise
 

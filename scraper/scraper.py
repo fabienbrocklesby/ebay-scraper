@@ -209,6 +209,8 @@ def scrape_item(
         )
         if response.status_code == 404:
             return None
+        if response.status_code == 403:
+            raise ChallengeError(f"eBay 403 block fetching item {item_url}")
         response.raise_for_status()
 
         if is_challenge_page(response.text):

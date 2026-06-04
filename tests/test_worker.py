@@ -106,3 +106,30 @@ def test_scrape_batch_drops_failures_after_max_attempts(monkeypatch):
     monkeypatch.setattr(w, "_requeue_failed", lambda *a, **k: called.update(requeued=True))
     w.scrape_batch(["https://www.ebay.com.au/itm/1"], "watch", "https://store", attempt=3)
     assert called["requeued"] is False
+
+
+def test_warmed_session_warms_once_and_reuses(monkeypatch):
+    import scraper.worker as w
+    w._session_local.__dict__.pop("sessions", None)
+    builds = []
+
+    class _FakeSess:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.warmed = 0
+
+        def get(self, url, **kwargs):
+            self.warmed += 1
+            return None
+
+    monkeypatch.setattr(w, "build_session", lambda proxy=None: (builds.append(proxy) or _FakeSess(proxy)))
+
+    s1 = w._warmed_session(None, "https://www.ebay.com.au/itm/111111111111")
+    s2 = w._warmed_session(None, "https://www.ebay.com.au/itm/222222222222")
+    assert s1 is s2          # same proxy+host reuses the warmed session
+    assert len(builds) == 1  # session built once
+    assert s1.warmed == 1    # homepage warmed exactly once
+
+    s3 = w._warmed_session("http://proxy:8080", "https://www.ebay.com.au/itm/333333333333")
+    assert s3 is not s1      # a different proxy gets its own warmed session
+    assert len(builds) == 2
