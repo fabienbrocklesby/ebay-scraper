@@ -13,6 +13,8 @@ _JOB_RETRY = Retry(max=3, interval=[120, 300, 900])
 
 _ITEM_ID_RE = re.compile(r"/itm/(\d+)")
 
+_BATCH_SIZE = 200
+
 
 def _item_id_from_url(item_url: str) -> str:
     m = _ITEM_ID_RE.search(item_url)
@@ -44,27 +46,27 @@ def enqueue_items(
     niche: str,
     store_url: str,
 ) -> int:
-    """Enqueue item URLs for scraping, skipping already-queued items.
+    """Enqueue item URLs as batched scrape_batch jobs, skipping already-queued items.
 
-    Deduplication is keyed on item_id (extracted from the URL) so the same
-    item is not scraped twice even if it appears in multiple stores.
+    Deduplication is keyed on item_id (extracted from the URL) so the same item is
+    not scraped twice even across stores. New URLs are chunked into batches of
+    _BATCH_SIZE and each batch becomes one scrape_batch job.
     """
-    from scraper.worker import scrape_and_store  # late import: worker imports queue, avoid circular
-    enqueued = 0
+    from scraper.worker import scrape_batch  # late import: worker imports queue, avoid circular
+
+    new_urls: list[str] = []
     for item_url in item_urls:
         item_id = _item_id_from_url(item_url)
         if is_item_queued(redis_conn, item_id):
             continue
-        queue.enqueue(
-            scrape_and_store,
-            item_url,
-            niche,
-            store_url,
-            job_timeout=300,
-            retry=_JOB_RETRY,
-        )
         mark_item_queued(redis_conn, item_id)
-        enqueued += 1
+        new_urls.append(item_url)
+
+    enqueued = 0
+    for i in range(0, len(new_urls), _BATCH_SIZE):
+        batch = new_urls[i : i + _BATCH_SIZE]
+        queue.enqueue(scrape_batch, batch, niche, store_url, 0, job_timeout=600, retry=_JOB_RETRY)
+        enqueued += len(batch)
     return enqueued
 
 

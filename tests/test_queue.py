@@ -22,7 +22,8 @@ def test_enqueue_items_enqueues_all_new():
         mock_queue, mock_redis, item_urls,
         niche="test", store_url="https://www.ebay.com/str/s"
     )
-    assert mock_queue.enqueue.call_count == 3
+    # All 3 URLs fit in a single batch (batch size >= 3), so one enqueue call.
+    assert mock_queue.enqueue.call_count == 1
     assert count == 3
 
 
@@ -38,8 +39,21 @@ def test_enqueue_items_skips_already_queued():
         mock_queue, mock_redis, item_urls,
         niche="test", store_url="https://www.ebay.com/str/s"
     )
+    # Only 1 new URL, fits in one batch.
     assert mock_queue.enqueue.call_count == 1
     assert count == 1
+
+
+def test_enqueue_items_batches_by_size(monkeypatch):
+    import scraper.queue as q
+    monkeypatch.setattr(q, "_BATCH_SIZE", 2)
+    queue = MagicMock()
+    redis_conn = MagicMock()
+    redis_conn.sismember.return_value = False
+    urls = [f"https://www.ebay.com.au/itm/{i}" for i in ("111", "222", "333")]
+    count = enqueue_items(queue, redis_conn, urls, "watch", "https://store")
+    assert count == 3
+    assert queue.enqueue.call_count == 2
 
 
 def test_is_item_queued_true_when_member():
