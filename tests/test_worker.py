@@ -1,50 +1,5 @@
-import pytest
 from unittest.mock import MagicMock, patch
 from scraper.scraper import ProductData
-
-
-def make_mock_product():
-    return ProductData(
-        item_id="123",
-        title="Test Product",
-        price=9.99,
-        currency="USD",
-        condition="New",
-        description="",
-        image_urls="https://img.ebay.com/1.jpg",
-        item_url="https://www.ebay.com/itm/123",
-        seller_id="seller1",
-        category="Electronics",
-        item_specifics="{}",
-        mpn="",
-        upc="",
-        shipping="Free",
-        listing_type="Buy It Now",
-    )
-
-
-ITEM_URL = "https://www.ebay.com/itm/123"
-
-
-def test_scrape_and_store_inserts_on_success(monkeypatch):
-    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://scraper:scraper@localhost/ebayscraper")
-    monkeypatch.setenv("PROXY_URL", "")
-
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.__enter__ = lambda s: s
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_cursor.__enter__ = lambda s: s
-    mock_cursor.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value = mock_cursor
-
-    with patch("scraper.worker.scrape_item", return_value=make_mock_product()), \
-         patch("scraper.worker.psycopg2.connect", return_value=mock_conn):
-        from scraper.worker import scrape_and_store
-        scrape_and_store(ITEM_URL, "electronics", "https://www.ebay.com/str/test")
-        assert mock_cursor.execute.called
-        assert mock_conn.commit.called
 
 
 def _pd(item_id):
@@ -74,20 +29,6 @@ def test_bulk_upsert_executes_values_once(monkeypatch):
     assert "ON CONFLICT (item_id)" in captured["sql"]
     assert "is_active" in captured["sql"]
     assert mock_conn.commit.called
-
-
-def test_scrape_and_store_skips_on_none_result(monkeypatch):
-    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://scraper:scraper@localhost/ebayscraper")
-    monkeypatch.setenv("PROXY_URL", "")
-
-    mock_conn = MagicMock()
-
-    with patch("scraper.worker.scrape_item", return_value=None), \
-         patch("scraper.worker.psycopg2.connect", return_value=mock_conn):
-        from scraper.worker import scrape_and_store
-        scrape_and_store("https://www.ebay.com/itm/000", "electronics", "https://www.ebay.com/str/test")
-        assert not mock_conn.commit.called
 
 
 from scraper.fetch import ChallengeError
@@ -127,3 +68,41 @@ def test_scrape_one_returns_none_on_404(monkeypatch):
     bucket = TokenBucket(1000.0)
     state = BoxProxyState(0.15, 10.0)
     assert w._scrape_one("https://www.ebay.com.au/itm/1", None, state, bucket) is None
+
+
+def test_scrape_batch_fetches_concurrently_and_bulk_writes(monkeypatch):
+    import scraper.worker as w
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setattr(w, "_get_proxy_url", lambda s: None)
+
+    def fake_scrape_one(url, residential, state, bucket):
+        if url.endswith("999"):
+            raise Exception("boom")
+        return _pd(url.rsplit("/", 1)[1])
+
+    written = {}
+    requeued = {}
+    monkeypatch.setattr(w, "_scrape_one", fake_scrape_one)
+    monkeypatch.setattr(w, "_bulk_upsert", lambda db, prods, niche, store: written.update({"n": len(prods)}))
+    monkeypatch.setattr(w, "_requeue_failed", lambda urls, niche, store, attempt: requeued.update({"urls": list(urls), "attempt": attempt}))
+
+    urls = [f"https://www.ebay.com.au/itm/{i}" for i in ("111", "222", "999")]
+    w.scrape_batch(urls, "watch", "https://store", attempt=0)
+
+    assert written["n"] == 2
+    assert requeued["urls"] == ["https://www.ebay.com.au/itm/999"]
+    assert requeued["attempt"] == 1
+
+
+def test_scrape_batch_drops_failures_after_max_attempts(monkeypatch):
+    import scraper.worker as w
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setattr(w, "_get_proxy_url", lambda s: None)
+    monkeypatch.setattr(w, "_scrape_one", lambda *a, **k: (_ for _ in ()).throw(Exception("x")))
+    monkeypatch.setattr(w, "_bulk_upsert", lambda *a, **k: None)
+    called = {"requeued": False}
+    monkeypatch.setattr(w, "_requeue_failed", lambda *a, **k: called.update(requeued=True))
+    w.scrape_batch(["https://www.ebay.com.au/itm/1"], "watch", "https://store", attempt=3)
+    assert called["requeued"] is False

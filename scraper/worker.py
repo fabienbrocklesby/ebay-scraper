@@ -1,6 +1,5 @@
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from typing import Optional
 
 from psycopg2.extras import execute_values
@@ -25,23 +24,6 @@ def _get_proxy_url(settings: Settings) -> str | None:
         val = raw.decode().strip()
         return val if val else None
     return settings.proxy_url
-
-INSERT_SQL = """
-    INSERT INTO products (
-        item_id, title, price, currency, condition, description,
-        image_urls, item_url, seller_id, store_url, category,
-        item_specifics, mpn, upc, shipping, listing_type, niche, scraped_at
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (item_id) DO UPDATE SET
-        title=EXCLUDED.title, price=EXCLUDED.price, currency=EXCLUDED.currency,
-        condition=EXCLUDED.condition, description=EXCLUDED.description,
-        image_urls=EXCLUDED.image_urls, item_url=EXCLUDED.item_url,
-        seller_id=EXCLUDED.seller_id, store_url=EXCLUDED.store_url,
-        category=EXCLUDED.category, item_specifics=EXCLUDED.item_specifics,
-        mpn=EXCLUDED.mpn, upc=EXCLUDED.upc,
-        shipping=EXCLUDED.shipping, listing_type=EXCLUDED.listing_type,
-        niche=EXCLUDED.niche, scraped_at=EXCLUDED.scraped_at
-"""
 
 
 _BULK_COLUMNS = (
@@ -122,51 +104,63 @@ def _scrape_one(item_url: str, residential_proxy: str | None, box_state: BoxProx
         raise
 
 
-def scrape_and_store(item_url: str, niche: str, store_url: str) -> None:
-    """Scrape a single eBay item and persist it to Postgres.
+_MAX_BATCH_ATTEMPTS = 3
 
-    Accepts the full item URL (e.g. https://www.ebay.com.au/itm/123) so the
-    correct eBay domain is used for non-US stores.
 
-    Intended to be enqueued as an rq job. Uses psycopg2 (sync) deliberately:
-    rq worker processes are synchronous, and mixing asyncpg into a sync context
-    would require creating a new event loop per job, which is fragile.
+def scrape_batch(item_urls: list[str], niche: str, store_url: str, attempt: int = 0) -> None:
+    """rq job: fetch a batch of item URLs concurrently and bulk-upsert the results.
+
+    Failed items are collected and re-enqueued as a smaller batch, up to
+    _MAX_BATCH_ATTEMPTS total attempts, so a few bad items never fail the whole
+    batch and never loop forever.
+
+    eBay's item JSON-LD often omits the seller, but an item in a store belongs
+    to that store's seller, so seller_id is derived from the store URL when missing.
     """
     settings = Settings()
-    # Enforce rate limit between jobs so a single proxy IP isn't volume-flagged.
-    # scrape_item already sleeps 1s internally; this adds the remainder.
-    if settings.requests_per_second > 0:
-        time.sleep(max(0.0, (1.0 / settings.requests_per_second) - 1.0))
-    product: Optional[ProductData] = scrape_item(item_url, proxy_url=_get_proxy_url(settings))
-    if product is None:
-        return
+    residential = _get_proxy_url(settings)
+    bucket = TokenBucket(settings.max_rps_per_ip)
+    box_state = BoxProxyState(
+        settings.challenge_escalation_threshold, settings.challenge_cooldown_seconds
+    )
 
-    # eBay's item JSON-LD often omits the seller, but an item in a store belongs
-    # to that store's seller, so derive it from the store URL when it is missing.
-    if not product.seller_id:
-        try:
-            product.seller_id = extract_seller_id(store_url)
-        except ValueError:
-            pass
+    results: list[ProductData] = []
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=settings.worker_concurrency) as ex:
+        futures = {
+            ex.submit(_scrape_one, url, residential, box_state, bucket): url
+            for url in item_urls
+        }
+        for fut in as_completed(futures):
+            url = futures[fut]
+            try:
+                data = fut.result()
+                if data is not None:
+                    if not data.seller_id:
+                        try:
+                            data.seller_id = extract_seller_id(store_url)
+                        except ValueError:
+                            pass
+                    results.append(data)
+            except Exception:
+                failed.append(url)
 
-    conn = psycopg2.connect(settings.database_url)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(INSERT_SQL, (
-                product.item_id, product.title, product.price, product.currency,
-                product.condition, product.description, product.image_urls,
-                product.item_url, product.seller_id, store_url, product.category,
-                product.item_specifics, product.mpn, product.upc,
-                product.shipping, product.listing_type,
-                niche, datetime.now(timezone.utc),
-            ))
-        conn.commit()
-    finally:
-        conn.close()
+    if results:
+        _bulk_upsert(settings.database_url, results, niche, store_url)
+    if failed and attempt + 1 < _MAX_BATCH_ATTEMPTS:
+        _requeue_failed(failed, niche, store_url, attempt + 1)
+
+
+def _requeue_failed(item_urls: list[str], niche: str, store_url: str, attempt: int) -> None:
+    from scraper.queue import get_redis, get_queue
+    settings = Settings()
+    conn = get_redis(settings.redis_url)
+    queue = get_queue(conn)
+    queue.enqueue(scrape_batch, item_urls, niche, store_url, attempt, job_timeout=600)
 
 
 def crawl_store(store_url: str, niche: str) -> None:
-    """Paginate a store page and enqueue individual item scrape jobs.
+    """Paginate a store page and enqueue item scrape jobs.
 
     Runs on VPS workers. Uses late imports to avoid circular dependency with queue.py.
     """
