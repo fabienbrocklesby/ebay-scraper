@@ -47,6 +47,35 @@ def test_scrape_and_store_inserts_on_success(monkeypatch):
         assert mock_conn.commit.called
 
 
+def _pd(item_id):
+    return ProductData(
+        item_id=item_id, title="t", price=1.0, currency="AUD", condition="New",
+        description="d", image_urls="u", item_url=f"https://www.ebay.com.au/itm/{item_id}",
+        seller_id="s", category="c", item_specifics="{}", mpn="", upc="",
+        shipping="", listing_type="FixedPrice",
+    )
+
+
+def test_bulk_upsert_executes_values_once(monkeypatch):
+    import scraper.worker as w
+    captured = {}
+
+    def fake_execute_values(cur, sql, rows, template=None, page_size=100):
+        captured["sql"] = sql
+        captured["rows"] = list(rows)
+
+    mock_conn = MagicMock()
+    monkeypatch.setattr(w.psycopg2, "connect", lambda dsn: mock_conn)
+    monkeypatch.setattr(w, "execute_values", fake_execute_values)
+
+    w._bulk_upsert("postgresql://x/y", [_pd("111111111111"), _pd("222222222222")], "watch", "https://store")
+
+    assert len(captured["rows"]) == 2
+    assert "ON CONFLICT (item_id)" in captured["sql"]
+    assert "is_active" in captured["sql"]
+    assert mock_conn.commit.called
+
+
 def test_scrape_and_store_skips_on_none_result(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
     monkeypatch.setenv("DATABASE_URL", "postgresql://scraper:scraper@localhost/ebayscraper")
