@@ -1,14 +1,16 @@
 import psycopg2
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
 
 from psycopg2.extras import execute_values
 
 from scraper.config import Settings
+from scraper.fetch import ChallengeError, WrongCountryError, build_session, apply_proxy_country
 from scraper.queue import PROXY_REDIS_KEY
 from scraper.scraper import scrape_item, ProductData
 from scraper.store import extract_seller_id
+from scraper.throttle import TokenBucket, BoxProxyState
 
 
 def _get_proxy_url(settings: Settings) -> str | None:
@@ -93,6 +95,31 @@ def _bulk_upsert(database_url: str, products: list[ProductData], niche: str, sto
         conn.commit()
     finally:
         conn.close()
+
+
+def _scrape_one(item_url: str, residential_proxy: str | None, box_state: BoxProxyState, bucket: TokenBucket) -> Optional[ProductData]:
+    """Fetch one item. Box IP first; on challenge or wrong country, retry via residential.
+
+    A curl_cffi session is built and injected per attempt, which makes scrape_item
+    skip its homepage warmup and 1s sleep (those only run on its own-client path).
+    The TokenBucket is therefore the only rate governor. Raises if the residential
+    retry also fails so the caller can mark the item failed.
+    """
+    bucket.acquire()
+    use_residential = bool(box_state.should_use_residential() and residential_proxy)
+    proxy = residential_proxy if use_residential else None
+    try:
+        session = build_session(apply_proxy_country(proxy, item_url))
+        data = scrape_item(item_url, proxy_url=proxy, client=session)
+        box_state.record(challenged=False)
+        return data
+    except (ChallengeError, WrongCountryError):
+        box_state.record(challenged=True)
+        if residential_proxy and not use_residential:
+            bucket.acquire()
+            session = build_session(apply_proxy_country(residential_proxy, item_url))
+            return scrape_item(item_url, proxy_url=residential_proxy, client=session)
+        raise
 
 
 def scrape_and_store(item_url: str, niche: str, store_url: str) -> None:

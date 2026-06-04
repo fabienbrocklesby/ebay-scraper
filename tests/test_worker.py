@@ -88,3 +88,42 @@ def test_scrape_and_store_skips_on_none_result(monkeypatch):
         from scraper.worker import scrape_and_store
         scrape_and_store("https://www.ebay.com/itm/000", "electronics", "https://www.ebay.com/str/test")
         assert not mock_conn.commit.called
+
+
+from scraper.fetch import ChallengeError
+from scraper.throttle import TokenBucket, BoxProxyState
+
+
+def test_scrape_one_injects_session_and_escalates_on_challenge(monkeypatch):
+    import scraper.worker as w
+    calls = []  # (proxy_url, client)
+
+    monkeypatch.setattr(w, "build_session", lambda proxy=None: f"session::{proxy}")
+
+    def fake_scrape_item(item_url, proxy_url=None, client=None):
+        calls.append((proxy_url, client))
+        if proxy_url is None:
+            raise ChallengeError("blocked")
+        return _pd("111111111111")
+
+    monkeypatch.setattr(w, "scrape_item", fake_scrape_item)
+    bucket = TokenBucket(1000.0)
+    state = BoxProxyState(threshold=0.15, cooldown_seconds=10.0)
+
+    result = w._scrape_one(
+        "https://www.ebay.com.au/itm/111111111111",
+        residential_proxy="http://user:pass@proxy:8080",
+        box_state=state, bucket=bucket,
+    )
+    assert result is not None
+    assert [c[0] for c in calls] == [None, "http://user:pass@proxy:8080"]
+    assert all(c[1] is not None for c in calls)
+
+
+def test_scrape_one_returns_none_on_404(monkeypatch):
+    import scraper.worker as w
+    monkeypatch.setattr(w, "build_session", lambda proxy=None: "session")
+    monkeypatch.setattr(w, "scrape_item", lambda *a, **k: None)
+    bucket = TokenBucket(1000.0)
+    state = BoxProxyState(0.15, 10.0)
+    assert w._scrape_one("https://www.ebay.com.au/itm/1", None, state, bucket) is None
