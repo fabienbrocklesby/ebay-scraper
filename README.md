@@ -560,8 +560,13 @@ pipx reinstall ebay-scraper
   bug here. Most seller stores are well under it.
 - **Throughput scales with worker boxes.** Each box runs at its `MAX_RPS_PER_IP`
   cap (default 6 items/sec ≈ 550k/day). Add boxes, or raise the cap on a
-  residential box, to reach millions/day. Measured live: ~6-7 items/sec/box on a
-  residential IP at the default, 200/200 items per batch with no blocks.
+  residential box, to reach millions/day. Measured live on a residential IP:
+  ~6-8 items/sec/box, 200/200 items per batch, and a soak of 2,000+ consecutive
+  detail fetches from a single residential IP at ~8/sec with **zero** blocks.
+  Caveat for the first big run: that soak covers minutes, not a multi-hour
+  backfill, so watch the block rate on your first long backfill; if a single IP
+  starts getting challenged at high sustained volume, lower `MAX_RPS_PER_IP` or
+  add more residential boxes (the worker also auto-falls back to the proxy).
 - **Cost depends on worker IP type, not on the tool.** On residential-IP boxes
   the detail fetches are direct and free, so a large one-time backfill costs
   essentially nothing but time. On datacenter/VPS boxes the same fetches go
