@@ -155,6 +155,31 @@ def _find_product_ld(soup: BeautifulSoup) -> Optional[dict]:
     return None
 
 
+def _extract_gallery_images(soup: BeautifulSoup, ld_json: dict) -> list[str]:
+    """Return the full product image gallery as full-resolution URLs.
+
+    eBay's JSON-LD `image` field is only a partial set (often about five). The
+    complete gallery lives in the image carousel, where each photo appears at
+    several sizes under one hash. We take the distinct hashes in carousel order
+    and rewrite each to the largest size eBay serves (s-l1600.jpg). If the
+    carousel is absent (page structure changed), fall back to the JSON-LD images.
+    """
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for img in soup.select(".ux-image-carousel-item img, .ux-image-grid-item img"):
+        src = img.get("src") or img.get("data-src") or ""
+        match = re.search(r"/images/g/([^/]+)/", src)
+        if match and match.group(1) not in seen:
+            seen.add(match.group(1))
+            hashes.append(match.group(1))
+    if hashes:
+        return [f"https://i.ebayimg.com/images/g/{h}/s-l1600.jpg" for h in hashes]
+    images = ld_json.get("image", [])
+    if isinstance(images, str):
+        images = [images]
+    return list(images)
+
+
 def scrape_item(
     item_url: str,
     proxy_url: Optional[str] = None,
@@ -225,9 +250,7 @@ def scrape_item(
         if isinstance(offers, list):
             offers = offers[0] if offers else {}
 
-        images = ld_json.get("image", [])
-        if isinstance(images, str):
-            images = [images]
+        images = _extract_gallery_images(soup, ld_json)
 
         item_specifics = _extract_item_specifics(soup)
         item_id = _item_id_from_url(item_url)

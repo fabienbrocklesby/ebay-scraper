@@ -204,3 +204,24 @@ def test_scrape_item_handles_jsonld_array():
     assert product.title == "AU Product"
     assert product.currency == "AUD"
     assert product.item_id == "399000000001"
+
+
+def test_extract_gallery_images_full_resolution():
+    from pathlib import Path
+    from bs4 import BeautifulSoup
+    from scraper.scraper import _extract_gallery_images
+    html = (Path(__file__).parent / "fixtures" / "item_gallery.html").read_text()
+    soup = BeautifulSoup(html, "html.parser")
+    imgs = _extract_gallery_images(soup, {})
+    assert len(imgs) == 12               # full gallery, not the JSON-LD subset of ~5
+    assert len(set(imgs)) == 12          # deduplicated
+    assert all(u.startswith("https://i.ebayimg.com/images/g/") for u in imgs)
+    assert all(u.endswith("/s-l1600.jpg") for u in imgs)
+
+
+def test_extract_gallery_falls_back_to_jsonld_when_no_carousel():
+    from bs4 import BeautifulSoup
+    from scraper.scraper import _extract_gallery_images
+    soup = BeautifulSoup("<div>no carousel here</div>", "html.parser")
+    imgs = _extract_gallery_images(soup, {"image": ["https://i.ebayimg.com/x/a.jpg"]})
+    assert imgs == ["https://i.ebayimg.com/x/a.jpg"]

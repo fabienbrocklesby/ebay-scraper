@@ -412,6 +412,29 @@ def _canonical_store_url(url: str) -> str:
     return _normalize_store_url(converted if converted else url)
 
 
+def _parse_store_lines(text: str, default_niche: str | None) -> list[tuple[str, str]]:
+    """Parse a bulk store file into (canonical_url, niche) pairs.
+
+    Each non-blank, non-comment line is 'URL' or 'URL,niche'. A line's own niche
+    wins; otherwise default_niche applies. Blank lines and lines starting with '#'
+    are skipped. Raises click.ClickException if a line has no niche and no default.
+    """
+    entries: list[tuple[str, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",", 1)]
+        url = parts[0]
+        niche = parts[1] if len(parts) > 1 and parts[1] else default_niche
+        if not niche:
+            raise click.ClickException(
+                f"Line {lineno}: no niche for '{url}'. Add ',<niche>' or pass --niche."
+            )
+        entries.append((_canonical_store_url(url), niche))
+    return entries
+
+
 @store.command("add")
 @click.argument("url")
 @click.option("--niche", required=True, help="Tag for this store (e.g. electronics)")
@@ -436,6 +459,33 @@ def store_add(url: str, niche: str) -> None:
     asyncio.run(_run())
     click.echo(f"Store registered: {canonical}  [{niche}]")
     click.echo("Run 'scraper scrape start' to begin scraping.")
+
+
+@store.command("import")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--niche", default=None, help="Default niche for lines that don't set their own.")
+def store_import(file: str, niche: str | None) -> None:
+    """Bulk-register stores from a text file.
+
+    One store per line: 'URL' or 'URL,niche'. Blank lines and lines starting with
+    '#' are ignored. Use --niche to set a default niche for lines without one.
+    """
+    settings = Settings()
+    entries = _parse_store_lines(Path(file).read_text(), niche)
+    if not entries:
+        click.echo("No stores found in file.")
+        return
+
+    async def _run() -> None:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            for url, store_niche in entries:
+                await add_store(pool, url, store_niche)
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+    click.echo(f"Imported {len(entries)} stores.")
 
 
 @store.command("list")
