@@ -137,6 +137,71 @@ def _recover_from_challenge(
     )
 
 
+_ITM_RE = re.compile(r"/itm/(\d{11,13})")
+_PRICE_RE = re.compile(r"[\d][\d,]*\.\d{2}")
+
+
+def parse_listing_cards(html: str) -> list[tuple[str, float | None, str]]:
+    """Extract (item_id, price, item_url) from each store listing card.
+
+    eBay store cards use the container class `.str-item-card`. A few promo/header
+    cards carry no item link and are skipped. Price is parsed from the card text
+    (first currency-looking number); None if the card shows no price.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[tuple[str, float | None, str]] = []
+    seen: set[str] = set()
+    for card in soup.select(".str-item-card"):
+        link = card.find("a", href=_ITM_RE)
+        if not link:
+            continue
+        m = _ITM_RE.search(link["href"])
+        if not m:
+            continue
+        item_id = m.group(1)
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        pm = _PRICE_RE.search(card.get_text(" ", strip=True))
+        price = float(pm.group(0).replace(",", "")) if pm else None
+        url = f"https://www.ebay.com.au/itm/{item_id}"
+        out.append((item_id, price, url))
+    return out
+
+
+def get_store_listings(
+    store_url: str,
+    proxy_url: str | None = None,
+    max_pages: int = 9999,
+    max_challenge_retries: int = 4,
+    _session: Any | None = None,
+) -> list[tuple[str, float | None, str]]:
+    """Crawl store listing pages, returning (item_id, price, item_url) per card.
+
+    Cheaper than get_item_urls_from_store for delta: one request yields ~200
+    items with their current price, no detail-page hits.
+    """
+    base = _normalize_store_url(store_url)
+    session = _session or build_session(apply_proxy_country(proxy_url, base))
+    collected: dict[str, tuple[str, float | None, str]] = {}
+    page = 1
+    while page <= max_pages:
+        html = session.get(_page_url(base, page), timeout=30).text
+        if is_challenge_page(html):
+            raise ChallengeError(
+                f"challenge on listing page {page}, gathered {len(collected)}"
+            )
+        cards = parse_listing_cards(html)
+        if not cards:
+            break
+        for item_id, price, url in cards:
+            collected.setdefault(item_id, (item_id, price, url))
+        if not _has_next_page(html):
+            break
+        page += 1
+    return list(collected.values())
+
+
 def get_item_urls_from_store(
     store_url: str,
     proxy_url: str | None = None,
