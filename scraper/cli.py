@@ -549,6 +549,59 @@ def scrape_start(niche: str | None) -> None:
         )
 
 
+@scrape.command("delta")
+@click.option("--niche", default=None, help="Only delta-scan stores with this niche tag.")
+def scrape_delta(niche: str | None) -> None:
+    """Re-scan store listing pages and queue only new or price-changed items."""
+    from scraper.store import get_store_listings
+    from scraper.delta import compute_delta
+    from scraper.db import get_store_item_prices, mark_items_inactive
+    from scraper.queue import mark_item_queued
+    from scraper.worker import scrape_batch
+
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    queue = get_queue(redis_conn)
+    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
+    proxy_url = proxy_url or None
+
+    async def _run() -> None:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            stores = await list_stores(pool)
+            selected = [s for s in stores if not niche or s["niche"] == niche]
+            if not selected:
+                click.echo("No stores registered. Use 'scraper store add <url> --niche <tag>'")
+                return
+            for s in selected:
+                store_url = s["store_url"]
+                try:
+                    listings = get_store_listings(store_url, proxy_url=proxy_url)
+                except ChallengeError as exc:
+                    click.echo(f"  {store_url} BLOCKED: {exc}", err=True)
+                    continue
+                db_prices = await get_store_item_prices(pool, store_url)
+                to_fetch, to_deactivate = compute_delta(
+                    [(item_id, price) for (item_id, price, _url) in listings], db_prices
+                )
+                url_by_id = {item_id: url for (item_id, _price, url) in listings}
+                fetch_urls = [url_by_id[item_id] for item_id in to_fetch]
+                for item_id in to_fetch:
+                    mark_item_queued(redis_conn, item_id)
+                queued = 0
+                for j in range(0, len(fetch_urls), settings.batch_size):
+                    batch = fetch_urls[j : j + settings.batch_size]
+                    queue.enqueue(scrape_batch, batch, s["niche"], store_url, 0, job_timeout=600)
+                    queued += len(batch)
+                deactivated = await mark_items_inactive(pool, store_url, to_deactivate)
+                click.echo(f"{store_url}: {queued} queued, {deactivated} deactivated")
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
 @scrape.command("stop")
 def scrape_stop() -> None:
     """Cancel all pending scrape jobs in the queue.
