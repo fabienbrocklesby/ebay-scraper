@@ -357,10 +357,18 @@ All of these run on the **coordinator**.
 ### Add stores to scrape
 
 ```bash
+# one at a time
 scraper store add https://www.ebay.com/str/sellername --niche car-parts
-scraper store add https://www.ebay.com.au/str/anotherseller --niche car-parts
+
+# or bulk, from a text file (one store per line: "URL" or "URL,niche")
+scraper store import stores.txt --niche car-parts
 scraper store list
 ```
+
+`store import` file format: one store per line, either `URL` or `URL,niche`.
+Blank lines and lines starting with `#` are ignored; a line's own niche wins,
+`--niche` is the default for lines without one. So Kieran can keep a single
+`stores.txt` and re-import it, or add stores one by one, whichever he prefers.
 
 A `/str/` or `/sch/` seller URL both work; the tool converts to the canonical
 store URL. The `--niche` tag groups items so you can export them separately later.
@@ -480,8 +488,9 @@ Columns: `item_id, title, price, currency, condition, description, image_urls,
 item_url, seller_id, store_url, category, item_specifics, mpn, upc, shipping,
 listing_type, niche, scraped_at`
 
-- `image_urls` — all listing image URLs, pipe-separated (`|`). Images are not
-  downloaded, only their URLs.
+- `image_urls` — the full product image gallery, pipe-separated (`|`), at full
+  resolution (`s-l1600`). Pulled from the item's image carousel, not just the
+  handful in the page metadata. Images are not downloaded, only their URLs.
 - `item_specifics` — JSON object of every eBay item specific (brand, model,
   colour, etc.).
 - `mpn` — Manufacturer Part Number pulled from the item specifics.
@@ -508,7 +517,8 @@ scrape again refreshes prices rather than creating duplicates.
 | `scraper proxy test` | coordinator | Test the proxy against live eBay |
 | `scraper proxy status` | coordinator | Show the active proxy |
 | `scraper proxy clear` | coordinator | Remove the proxy |
-| `scraper store add <url> --niche <tag>` | coordinator | Register a store |
+| `scraper store add <url> --niche <tag>` | coordinator | Register one store |
+| `scraper store import <file> [--niche <tag>]` | coordinator | Bulk-register stores from a text file |
 | `scraper store list` | coordinator | List registered stores |
 | `scraper store remove <url>` | coordinator | Unregister a store |
 | `scraper scrape start [--niche <tag>]` | coordinator | Backfill: crawl stores, queue all item jobs |
