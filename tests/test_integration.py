@@ -5,7 +5,7 @@ import asyncpg
 
 from scraper.db import get_products_by_niche, init_schema
 from scraper.export import export_to_csv
-from scraper.worker import scrape_and_store
+from scraper.worker import scrape_batch
 
 ITEM_HTML = """
 <html>
@@ -73,12 +73,12 @@ def test_scrape_store_export_full_flow(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", TEST_DB_URL)
     monkeypatch.setenv("PROXY_URL", "")
     monkeypatch.setenv("REQUESTS_PER_SECOND", "0")
-    monkeypatch.setattr("scraper.scraper.build_session", lambda proxy_url=None: _FakeSession())
+    monkeypatch.setattr("scraper.worker.build_session", lambda proxy=None: _FakeSession())
 
     item_url = "https://www.ebay.com/itm/777777777"
     store_url = "https://www.ebay.com/str/teststore"
 
-    scrape_and_store(item_url, "integration-test", store_url)
+    scrape_batch([item_url], "integration-test", store_url)
 
     async def check_and_export() -> tuple:
         pool = await asyncpg.create_pool(TEST_DB_URL)
