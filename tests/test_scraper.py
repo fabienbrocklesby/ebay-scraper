@@ -2,6 +2,7 @@ import json
 import pytest
 import respx
 import httpx
+from scraper.fetch import ChallengeError
 from scraper.scraper import scrape_item, ProductData
 
 ITEM_URL = "https://www.ebay.com/itm/123456789"
@@ -144,6 +145,28 @@ def test_scrape_item_shipping_and_listing_type():
     product = scrape_item(ITEM_URL, client=client)
     assert "free" in product.shipping.lower()
     assert product.listing_type == "Buy It Now"
+
+
+@respx.mock
+def test_scrape_item_raises_on_challenge_not_silent_none():
+    """A bot-challenge page (HTTP 200) must raise so rq retries, not drop the item."""
+    challenge_html = "<html><head><title>Security Measure | eBay</title></head></html>"
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=challenge_html))
+    client = httpx.Client(follow_redirects=True)
+    with pytest.raises(ChallengeError):
+        scrape_item(ITEM_URL, client=client)
+
+
+@respx.mock
+def test_scrape_item_cleans_entities_and_tags_in_title():
+    html = SAMPLE_HTML.replace(
+        "Genuine OEM Toyota Brake Pads", "Brake Pads 3/8&#034; Show<wbr>room 50&#039;"
+    )
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=html))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
+    client = httpx.Client(follow_redirects=True)
+    product = scrape_item(ITEM_URL, client=client)
+    assert product.title == "Brake Pads 3/8\" Showroom 50'"
 
 
 @respx.mock

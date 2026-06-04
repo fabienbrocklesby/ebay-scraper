@@ -1,20 +1,479 @@
 # eBay Scraper
 
-Distributed eBay product scraper. Scrapes full product data from eBay seller store URLs at scale and outputs to CSV.
+Distributed eBay product scraper. It pulls full product data from eBay seller
+store URLs at scale and writes it to CSV.
 
-**Architecture:** one coordinator machine runs Redis (job queue) and Postgres (results). Any number of worker VPS nodes connect to it, pull jobs from the queue, scrape eBay, and write results. Adding workers increases throughput linearly with no code changes.
+You run one **coordinator** machine (this can be a normal Windows PC) and as many
+**worker** VPS nodes as you want. The coordinator holds the job queue and the
+results database and runs the commands you type. The workers do the actual
+scraping in parallel. Adding more workers increases speed with no code changes.
+
+```
+                 ┌─────────────────────────────┐
+   you type ───▶ │  COORDINATOR (Windows is OK) │
+   commands      │  - Redis    (job queue)      │
+                 │  - Postgres (results)        │
+                 │  - runs store crawl + export │
+                 └──────────────┬──────────────┘
+                                │ private Tailscale network
+            ┌───────────────────┼───────────────────┐
+            ▼                   ▼                   ▼
+      ┌───────────┐       ┌───────────┐       ┌───────────┐
+      │ Linux VPS │       │ Linux VPS │  ...  │ Linux VPS │
+      │  worker   │       │  worker   │       │  worker   │
+      └───────────┘       └───────────┘       └───────────┘
+        all workers scrape eBay through one rotating residential proxy
+```
+
+Two things are required for it to work reliably, and both are explained below:
+
+1. **Tailscale** — a free private network so the workers can reach the
+   coordinator's Redis/Postgres without exposing them to the internet.
+2. **A rotating residential proxy** — eBay blocks any single IP address after a
+   few dozen requests. A rotating residential proxy gives every request a fresh
+   IP, which is what lets you scrape a whole store and run many workers. See
+   [Proxy setup](#proxy-setup-required). This is not optional for real use.
 
 ---
 
-## Install
+## Table of contents
 
-```bash
+- [Quick mental model](#quick-mental-model)
+- [Coordinator setup (Windows)](#coordinator-setup-windows)
+- [Coordinator setup (macOS / Linux)](#coordinator-setup-macos--linux)
+- [Proxy setup (required)](#proxy-setup-required)
+- [Adding a worker VPS from scratch](#adding-a-worker-vps-from-scratch)
+- [Daily use](#daily-use)
+- [5-minute smoke test](#5-minute-smoke-test)
+- [CSV output](#csv-output)
+- [Command reference](#command-reference)
+- [Troubleshooting](#troubleshooting)
+- [Limits and honest expectations](#limits-and-honest-expectations)
+
+---
+
+## Quick mental model
+
+- You install the `scraper` command on the coordinator and on every worker.
+- On the coordinator you: start the services, set the proxy once, add store URLs,
+  start a scrape, check progress, and export the CSV.
+- On each worker you run **one** command (`scraper init <coordinator-ip>`) and it
+  sets itself up and starts pulling jobs forever.
+- The proxy is set **once** on the coordinator and every worker picks it up
+  automatically. You never edit proxy settings on the workers.
+
+---
+
+## Coordinator setup (Windows)
+
+The coordinator can be a normal Windows 10/11 PC. It needs three things.
+
+### 1. Install Docker Desktop
+
+Download Docker Desktop from <https://docs.docker.com/get-docker/> and install it.
+On first run it will enable **WSL2** (Windows Subsystem for Linux). Accept that and
+reboot if it asks. When Docker Desktop shows "Engine running" in the bottom-left,
+it is ready.
+
+To confirm, open **PowerShell** and run:
+
+```powershell
+docker version
+```
+
+You should see a Server section. If you only see a Client section, Docker Desktop
+is not running yet — start it from the Start menu and wait.
+
+### 2. Install Python and the scraper
+
+Install Python 3.11 or newer from <https://www.python.org/downloads/> (tick
+"Add Python to PATH" in the installer). Then in PowerShell:
+
+```powershell
+python -m pip install --user pipx
+python -m pipx ensurepath
+```
+
+Close and reopen PowerShell, then install the scraper:
+
+```powershell
 pipx install git+https://github.com/OWNER/ebay-scraper
 ```
 
-Installs the `scraper` command globally. Works on macOS and Linux. Requires Python 3.11+ and pipx.
+Confirm it works:
 
-To update:
+```powershell
+scraper --help
+```
+
+### 3. Install Tailscale
+
+Download Tailscale from <https://tailscale.com/download/windows>, install it, and
+sign in. The Tailscale icon will appear in your system tray.
+
+**Find your coordinator's Tailscale IP** (you will give this to each worker). The
+easiest way on Windows is the Tailscale admin console: open
+<https://login.tailscale.com/admin/machines>, find this PC, and copy its IP
+(it looks like `100.x.y.z`). You can also right-click the tray icon; the IP is
+shown there.
+
+### 4. Start the coordinator services and database
+
+In PowerShell:
+
+```powershell
+scraper coordinator start
+scraper connect localhost
+scraper db init
+```
+
+- `coordinator start` launches Redis and Postgres as Docker containers that
+  restart automatically (including after a reboot).
+- `connect localhost` writes the local config so the coordinator's own commands
+  know where Redis and Postgres are.
+- `db init` creates the database tables.
+
+Check the services are up:
+
+```powershell
+scraper coordinator status
+```
+
+The coordinator is now ready. Next: [set the proxy](#proxy-setup-required).
+
+> Note: the coordinator only runs the services and the orchestration commands
+> (`store add`, `scrape start`, `export`). It does **not** run a worker. Workers
+> run on Linux VPS nodes (see below). Do not run `scraper worker start` on the
+> Windows coordinator.
+
+---
+
+## Coordinator setup (macOS / Linux)
+
+Same as Windows, but Tailscale's command line is available, so you can get the IP
+with a command.
+
+```bash
+# 1. Install Docker (Docker Desktop on macOS, or docker engine on Linux)
+# 2. Install the scraper
+pipx install git+https://github.com/OWNER/ebay-scraper
+# 3. Install Tailscale and join your tailnet
+#    macOS: https://tailscale.com/download     Linux: curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+# 4. Start services
+scraper coordinator start
+scraper connect localhost
+scraper db init
+# 5. Get the IP + ready-made worker command to run on each VPS
+scraper coordinator info
+```
+
+`scraper coordinator info` prints the coordinator's Tailscale IP and the exact
+`scraper init ...` command to run on each worker.
+
+---
+
+## Proxy setup (required)
+
+eBay challenges any single IP address after roughly 20-40 requests and then
+blocks it for about ten minutes. To scrape a full store and to run more than one
+worker, every request needs a fresh IP. That is what a **rotating residential
+proxy** does: you buy one plan, and a single endpoint rotates you through a large
+pool of IP addresses. You are billed by bandwidth (per GB), not per IP, so you do
+not buy "lots of proxies" — you buy one account.
+
+### Recommended: IPRoyal (pay-as-you-go, no monthly commitment)
+
+1. Sign up at <https://iproyal.com> and buy **Residential** traffic (not ISP, not
+   Web Unblocker). The minimum is 1 GB (about 1,000 items) and the traffic never
+   expires, so the first purchase doubles as your test credit.
+2. In the IPRoyal dashboard, get your proxy username and password. The endpoint is
+   `geo.iproyal.com:12321`.
+3. Build the proxy URL with the username and password as-is, no country token:
+
+   ```
+   http://USERNAME:PASSWORD@geo.iproyal.com:12321
+   ```
+
+   You do **not** pick a country. The scraper detects each store's eBay site
+   (`ebay.com`, `ebay.com.au`, `ebay.co.uk`, `ebay.de`, ...) and automatically
+   routes that store through an exit IP in the matching country, so one credential
+   scrapes any country's eBay correctly (right listings, right currency).
+
+4. Set it once on the coordinator. Every worker picks it up automatically on its
+   next job, with no restart:
+
+   ```bash
+   scraper proxy set "http://USERNAME:PASSWORD@geo.iproyal.com:12321"
+   scraper proxy test
+   ```
+
+   `proxy test` fetches a live eBay item through the proxy and tells you whether
+   it is working.
+
+   Use the **plain** endpoint above (no session token). The scraper handles IP
+   rotation itself: it gives each item its own connection (so every item scrapes
+   from a fresh IP) and rotates the connection every few pages while crawling a
+   store. That is what carries a crawl past eBay's per-IP block. This exact setup
+   was validated end to end against a live store (5,400+ items pulled in one crawl,
+   no blocks; 10/10 item pages scraped clean).
+
+### Free option for first validation: Webshare
+
+Webshare gives 10 rotating proxies and 1 GB/month free with no card
+(<https://www.webshare.io>). It is fine to prove the pipeline works before paying
+for IPRoyal. Set its proxy URL the same way with `scraper proxy set`.
+
+### Cheapest option: rotating datacenter (e.g. ProxyScrape)
+
+Datacenter proxies are far cheaper (often a few dollars, unmetered) but eBay
+challenges them more often. The scraper handles that gracefully now: a challenged
+item is retried automatically rather than silently dropped, so you lose speed, not
+data. Usable on a tight budget; residential is more reliable.
+
+To see or change the proxy later:
+
+```bash
+scraper proxy status      # show the active proxy (password masked)
+scraper proxy set <url>   # change it for all workers
+scraper proxy clear       # remove it (workers make direct requests)
+```
+
+---
+
+## Adding a worker VPS from scratch
+
+A worker is any fresh Linux VPS (Ubuntu 22.04 or Debian 12 recommended) from any
+provider (Hetzner, DigitalOcean, Vultr, etc.). One command sets it up.
+
+### 1. Create the VPS and log in
+
+Create the VPS in your provider's panel and SSH in as root:
+
+```bash
+ssh root@<vps-public-ip>
+```
+
+### 2. Install the scraper
+
+```bash
+apt update && apt install -y python3-pip pipx
+pipx ensurepath
+# reopen the shell, or run: source ~/.bashrc
+pipx install git+https://github.com/OWNER/ebay-scraper
+```
+
+### 3. Run the one-command setup
+
+Get the coordinator's Tailscale IP (`scraper coordinator info` on the coordinator,
+or the Tailscale admin console). Then on the VPS:
+
+```bash
+scraper init <coordinator-tailscale-ip>
+```
+
+This single command:
+
+- installs Tailscale and joins your tailnet (it prints a URL — open it once in a
+  browser to authorise the VPS; or pass `--tailscale-key tskey-...` to skip the
+  prompt, keys come from <https://login.tailscale.com/admin/settings/keys>),
+- installs Docker,
+- writes the config pointing at your coordinator,
+- builds the worker image and starts the worker container with
+  `--restart=always` so it survives reboots.
+
+That's it. The worker is now pulling jobs. You do **not** set the proxy here — it
+comes from the coordinator automatically.
+
+Repeat on as many VPS nodes as you want. They all share the one proxy and the one
+queue.
+
+### Confirm the worker is connected
+
+On the coordinator:
+
+```bash
+scraper scrape status
+```
+
+Once you start a scrape, the "Queued jobs" number will fall as workers process it.
+
+### Per-worker proxy (advanced, rarely needed)
+
+The normal setup uses one shared proxy for all workers, set on the coordinator.
+If you ever want a specific worker to use a different proxy (for example to split
+load across two proxy accounts), pass it at init time:
+
+```bash
+scraper init <coordinator-ip> --proxy "http://USER:PASS@host:port"
+```
+
+A proxy set this way on a worker is only its local fallback; `scraper proxy set`
+on the coordinator overrides it for all workers. For a single rotating account,
+just use the coordinator setting and ignore this.
+
+---
+
+## Daily use
+
+All of these run on the **coordinator**.
+
+### Add stores to scrape
+
+```bash
+scraper store add https://www.ebay.com/str/sellername --niche car-parts
+scraper store add https://www.ebay.com.au/str/anotherseller --niche car-parts
+scraper store list
+```
+
+A `/str/` or `/sch/` seller URL both work; the tool converts to the canonical
+store URL. The `--niche` tag groups items so you can export them separately later.
+
+### Start scraping
+
+```bash
+scraper scrape start                 # crawl all registered stores
+scraper scrape start --niche car-parts   # only that niche
+```
+
+This crawls each store's pages on the coordinator, finds every item, and queues
+the items as jobs. The workers scrape them. If eBay blocks a store mid-crawl, the
+command says so clearly and tells you which stores to re-run after the proxy
+cools down (it does not silently return a partial list).
+
+### Check progress
+
+```bash
+scraper scrape status
+```
+
+Shows jobs still queued, total items scraped, a per-niche breakdown, and the
+registered stores.
+
+### Export to CSV
+
+```bash
+scraper export --output products.csv
+scraper export --niche car-parts --output car-parts.csv
+```
+
+### Stop or clear
+
+```bash
+scraper scrape stop            # cancel pending jobs (in-flight jobs finish)
+scraper clear --niche car-parts   # delete scraped rows for a niche
+scraper store remove <url>     # unregister a store
+```
+
+---
+
+## 5-minute smoke test
+
+Run this once after setting everything up to prove the whole chain works. Use a
+small store so it finishes quickly.
+
+On the coordinator (services running, proxy set):
+
+```bash
+scraper store add https://www.ebay.com/str/hobbylinc --niche smoke-test
+scraper scrape start --niche smoke-test
+```
+
+You should see something like `10 items found, 10 new jobs queued`.
+
+On a worker (or wait for an existing worker), then back on the coordinator:
+
+```bash
+scraper scrape status     # Queued jobs should drop toward 0, Total scraped rise
+scraper export --niche smoke-test --output smoke.csv
+```
+
+Open `smoke.csv`. You should have one row per item with title, price, condition,
+images, item specifics and seller filled in. Then clean up:
+
+```bash
+scraper clear --niche smoke-test
+scraper store remove https://www.ebay.com/str/hobbylinc
+```
+
+---
+
+## CSV output
+
+Columns: `item_id, title, price, currency, condition, description, image_urls,
+item_url, seller_id, store_url, category, item_specifics, mpn, upc, shipping,
+listing_type, niche, scraped_at`
+
+- `image_urls` — all listing image URLs, pipe-separated (`|`). Images are not
+  downloaded, only their URLs.
+- `item_specifics` — JSON object of every eBay item specific (brand, model,
+  colour, etc.).
+- `mpn` — Manufacturer Part Number pulled from the item specifics.
+- `upc` — UPC/EAN barcode pulled from the item specifics.
+- `seller_id` — the store's seller.
+- `niche` — the tag you set when adding the store.
+
+Re-scraping an item updates its existing row (keyed on `item_id`), so running a
+scrape again refreshes prices rather than creating duplicates.
+
+---
+
+## Command reference
+
+| Command | Where | What it does |
+|---|---|---|
+| `scraper coordinator start` | coordinator | Start Redis + Postgres |
+| `scraper coordinator stop` | coordinator | Stop them |
+| `scraper coordinator status` | coordinator | Show their status |
+| `scraper coordinator info` | coordinator | Print Tailscale IP + worker command |
+| `scraper connect <host>` | any | Write config pointing at a coordinator |
+| `scraper db init` | coordinator | Create database tables |
+| `scraper proxy set <url>` | coordinator | Set the shared proxy for all workers |
+| `scraper proxy test` | coordinator | Test the proxy against live eBay |
+| `scraper proxy status` | coordinator | Show the active proxy |
+| `scraper proxy clear` | coordinator | Remove the proxy |
+| `scraper store add <url> --niche <tag>` | coordinator | Register a store |
+| `scraper store list` | coordinator | List registered stores |
+| `scraper store remove <url>` | coordinator | Unregister a store |
+| `scraper scrape start [--niche <tag>]` | coordinator | Crawl stores, queue item jobs |
+| `scraper scrape status` | coordinator | Show progress |
+| `scraper scrape stop` | coordinator | Cancel pending jobs |
+| `scraper export [--niche <tag>] --output <file>` | coordinator | Write CSV |
+| `scraper clear --niche <tag>` | coordinator | Delete scraped rows for a niche |
+| `scraper init <coordinator-ip>` | worker VPS | One-command worker setup |
+| `scraper worker start` | worker | Run a worker in the foreground (Linux) |
+
+---
+
+## Troubleshooting
+
+**`scraper proxy test` says FAIL / a bot-challenge page.**
+The proxy is being blocked. If it is a datacenter proxy, switch to a rotating
+residential one (IPRoyal). If residential, check the username/password and that
+you have bandwidth left in the account.
+
+**`scrape start` reports a store was "BLOCKED".**
+eBay challenged the coordinator's IP during the store crawl. Set a rotating
+residential proxy (`scraper proxy set`) if you have not, and re-run
+`scraper scrape start`. Already-queued items are not lost; only the blocked store
+needs re-running.
+
+**Workers are not picking up jobs (`scrape status` queue not dropping).**
+Check the worker can reach the coordinator over Tailscale: on the worker,
+`tailscale status` should list the coordinator, and `docker logs ebay-scraper-worker`
+shows what it is doing. Make sure `scraper coordinator status` shows Redis and
+Postgres up.
+
+**Worker container keeps restarting.**
+`docker logs ebay-scraper-worker` on the VPS shows the error. The most common
+cause is a wrong coordinator IP or the coordinator services not running.
+
+**macOS only: worker crashes with an `objc[...] fork()` error.**
+This only affects running a worker directly on macOS (not production Linux
+workers). Start it with `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES scraper worker
+start`. Production workers run on Linux and are unaffected.
+
+**Update the scraper to the latest version.**
 
 ```bash
 pipx reinstall ebay-scraper
@@ -22,148 +481,26 @@ pipx reinstall ebay-scraper
 
 ---
 
-## Network Setup (Tailscale, recommended)
+## Limits and honest expectations
 
-Tailscale creates an encrypted private network between your machines so Redis and Postgres are never exposed to the public internet.
-
-1. Install Tailscale on each machine: https://tailscale.com/download
-2. Run `tailscale up` on each machine to join your tailnet
-3. Use the Tailscale hostname (e.g. `mycoordinator.tail1234.ts.net`) when connecting workers
-
-Skip this step only for single-machine or LAN setups.
-
----
-
-## Coordinator Setup
-
-Run once on the machine that will host Redis and Postgres (requires Docker):
-
-```bash
-scraper coordinator start
-scraper connect localhost
-scraper db init
-```
-
-`coordinator start` launches Redis and Postgres as Docker containers with `restart: unless-stopped`.
-
-To check status or stop:
-
-```bash
-scraper coordinator status
-scraper coordinator stop
-```
+- **Large stores have an eBay-imposed ceiling.** eBay's store pagination stops
+  exposing items after roughly 10,000 per store. For stores bigger than that you
+  cannot get every single item through pagination — that is an eBay limit, not a
+  bug here. Most seller stores are well under it.
+- **Throughput depends entirely on the proxy.** With a real rotating residential
+  pool you can run many workers in parallel. With a single static IP (no
+  rotation) eBay will block it quickly and large crawls will fail loudly with a
+  clear message. The tool never pretends a blocked crawl succeeded.
+- **Bandwidth costs money.** Each item page is roughly 0.5-1 MB. Budget proxy
+  bandwidth accordingly (about 1 GB per 1,000 items).
 
 ---
 
-## Adding Worker VPS Nodes
-
-On each worker VPS:
-
-**Option 1: Docker worker (recommended)**
-
-```bash
-# Build the worker image (clone repo first, or copy Dockerfile)
-git clone https://github.com/OWNER/ebay-scraper
-cd ebay-scraper
-docker build -t ebay-scraper-worker .
-
-# Connect to coordinator, then print the docker run command
-scraper connect <coordinator-tailscale-hostname>
-scraper worker docker-run
-```
-
-Copy the printed `docker run` command and run it. It includes `--restart=always` so the worker survives reboots.
-
-**Option 2: Direct Python (if Python 3.11+ is available)**
-
-```bash
-pipx install git+https://github.com/OWNER/ebay-scraper
-scraper connect <coordinator-tailscale-hostname>
-scraper worker start
-```
-
----
-
-## Usage
-
-### Add stores to the queue
-
-```bash
-# Single store
-scraper add https://www.ebay.com/str/sellername --niche car-accessories
-
-# Australian eBay
-scraper add https://www.ebay.com.au/str/sellername --niche car-accessories
-
-# File of store URLs (one per line)
-scraper add stores.txt --niche car-accessories
-```
-
-The `--niche` tag groups items for filtered exports. The command crawls the store, skips already-queued items, and adds the rest to the Redis queue. Workers pick them up automatically.
-
-### Check progress
-
-```bash
-scraper status
-```
-
-Shows jobs waiting in queue, total products scraped, and a per-niche breakdown.
-
-### Export to CSV
-
-```bash
-# All products
-scraper export --output all-products.csv
-
-# Single niche
-scraper export --niche car-accessories --output car.csv
-```
-
-CSV columns: `item_id, title, price, currency, condition, description, image_urls, item_url, seller_id, store_url, category, item_specifics, mpn, upc, shipping, listing_type, niche, scraped_at`
-
-- `image_urls`: pipe-separated list of image URLs (no downloading)
-- `item_specifics`: JSON of all eBay item specifics (brand, model, colour, etc.)
-- `mpn`: Manufacturer Part Number extracted from item specifics
-- `upc`: UPC/EAN barcode extracted from item specifics
-
-### Clear a niche
-
-```bash
-scraper clear --niche car-accessories
-```
-
----
-
-## Configuration
-
-Config is stored at `~/.config/ebay-scraper/.env` (written by `scraper connect`). You can also set these as environment variables, which take precedence.
-
-| Variable | Required | Description |
-|---|---|---|
-| `REDIS_URL` | Yes | e.g. `redis://coordinator.ts.net:6379` |
-| `DATABASE_URL` | Yes | e.g. `postgresql://scraper:scraper@coordinator.ts.net:5432/ebayscraper` |
-| `PROXY_URL` | No | Rotating residential proxy: `http://user:pass@host:port` |
-| `REQUESTS_PER_SECOND` | No | Rate per worker (default: 0.5) |
-
-A residential proxy is required for VPS workers to scrape eBay item pages. Datacenter IPs receive JS challenge pages rather than product data. Set `PROXY_URL` before starting workers on a VPS.
-
----
-
-## Scale Reference
-
-| Workers | Items/day at 0.5 req/s |
-|---|---|
-| 1 | ~43,000 |
-| 5 | ~216,000 |
-| 10 | ~432,000 |
-| 25 | ~1,080,000 |
-
----
-
-## Running Tests (development)
+## Running the tests (development)
 
 ```bash
 docker compose up -d
-docker exec $(docker ps -qf "ancestor=postgres:16-alpine") psql -U scraper -c "CREATE DATABASE ebayscraper_test;" 2>/dev/null || true
+docker exec $(docker ps -qf "ancestor=postgres:16-alpine") psql -U scraper -d ebayscraper -c "CREATE DATABASE ebayscraper_test;" 2>/dev/null || true
+pip install -e ".[test]"
 pytest -v
 ```

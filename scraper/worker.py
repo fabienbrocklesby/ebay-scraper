@@ -6,6 +6,7 @@ from typing import Optional
 from scraper.config import Settings
 from scraper.queue import PROXY_REDIS_KEY
 from scraper.scraper import scrape_item, ProductData
+from scraper.store import extract_seller_id
 
 
 def _get_proxy_url(settings: Settings) -> str | None:
@@ -57,6 +58,14 @@ def scrape_and_store(item_url: str, niche: str, store_url: str) -> None:
     product: Optional[ProductData] = scrape_item(item_url, proxy_url=_get_proxy_url(settings))
     if product is None:
         return
+
+    # eBay's item JSON-LD often omits the seller, but an item in a store belongs
+    # to that store's seller, so derive it from the store URL when it is missing.
+    if not product.seller_id:
+        try:
+            product.seller_id = extract_seller_id(store_url)
+        except ValueError:
+            pass
 
     conn = psycopg2.connect(settings.database_url)
     try:

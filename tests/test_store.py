@@ -1,6 +1,7 @@
 import pytest
 import respx
 import httpx
+from scraper.fetch import ChallengeError
 from scraper.store import extract_seller_id, _normalize_store_url, _extract_item_urls, get_item_urls_from_store
 
 
@@ -89,3 +90,56 @@ def test_get_item_urls_returns_empty_on_no_listings():
         "https://www.ebay.com/str/emptyseller", max_pages=1, _session=session
     )
     assert urls == []
+
+
+@respx.mock
+def test_get_item_urls_raises_on_challenge_not_silent_truncation():
+    """A bot-challenge page (HTTP 200) must not be read as the end of the store."""
+    challenge_html = "<html><head><title>Security Measure | eBay</title></head></html>"
+    respx.get("https://www.ebay.com/").mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get("https://www.ebay.com/str/blockedseller").mock(
+        return_value=httpx.Response(200, text=challenge_html)
+    )
+    session = httpx.Client(follow_redirects=True)
+    with pytest.raises(ChallengeError):
+        get_item_urls_from_store(
+            "https://www.ebay.com/str/blockedseller", max_pages=1, _session=session
+        )
+
+
+class _FakeResponse:
+    def __init__(self, text: str):
+        self.status_code = 200
+        self.text = text
+
+
+class _FakeSession:
+    """Serves one canned page for any request, simulating one proxy exit IP."""
+
+    def __init__(self, text: str):
+        self._text = text
+
+    def get(self, url: str, **kwargs) -> _FakeResponse:
+        return _FakeResponse(self._text)
+
+    def close(self) -> None:
+        pass
+
+
+def test_recovers_from_transient_challenge(monkeypatch):
+    """A challenge mid-crawl must be retried on a fresh session, not silently dropped."""
+    challenge = "<html><head><title>Security Measure | eBay</title></head></html>"
+    good = (
+        '<html><body>'
+        '<a class="str-item-card__link" href="https://www.ebay.com/itm/555">x</a>'
+        '</body></html>'
+    )
+    # Initial session challenges; first retry still blocked; second retry succeeds.
+    behaviours = [challenge, challenge, good]
+    monkeypatch.setattr("scraper.store.build_session", lambda proxy_url=None: _FakeSession(behaviours.pop(0)))
+    monkeypatch.setattr("scraper.store.time.sleep", lambda _seconds: None)
+
+    urls = get_item_urls_from_store("https://www.ebay.com/str/seller", max_pages=1)
+
+    assert urls == ["https://www.ebay.com/itm/555"]
+    assert behaviours == []

@@ -14,6 +14,7 @@ from scraper.db import (
     add_store, clear_niche, get_counts, init_schema, list_stores, remove_store,
 )
 from scraper.export import export_to_csv
+from scraper.fetch import ChallengeError
 from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
 from scraper.store import _sch_to_str_url, _normalize_store_url, get_item_urls_from_store
@@ -34,15 +35,40 @@ def _is_command_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _tailscale_bin() -> str | None:
+    """Locate the tailscale CLI.
+
+    On Windows the CLI installs to Program Files and is not on PATH by default,
+    so the bare 'tailscale' command fails there. Fall back to the known install
+    locations before giving up.
+    """
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    candidates = [
+        Path(r"C:\Program Files\Tailscale\tailscale.exe"),
+        Path(r"C:\Program Files (x86)\Tailscale\tailscale.exe"),
+        Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def _get_tailscale_ip() -> str | None:
-    result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True)
+    binary = _tailscale_bin()
+    if not binary:
+        return None
+    result = subprocess.run([binary, "ip", "-4"], capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
 def _tailscale_connected() -> bool:
-    if not _is_command_available("tailscale"):
+    binary = _tailscale_bin()
+    if not binary:
         return False
-    result = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+    result = subprocess.run([binary, "status", "--json"], capture_output=True, text=True)
     if result.returncode != 0:
         return False
     try:
@@ -225,7 +251,7 @@ def init(coordinator_host: str, tailscale_key: str, proxy: str,
     click.echo(f"  Container '{_WORKER_CONTAINER}' started (restart=always)")
 
     click.echo("\nDone. Worker is running and will restart on reboot.")
-    click.echo("Run 'scraper status' on the coordinator to confirm it is pulling jobs.")
+    click.echo("Run 'scraper scrape status' on the coordinator to confirm it is pulling jobs.")
 
 
 # ---------------------------------------------------------------------------
@@ -485,19 +511,42 @@ def scrape_start(niche: str | None) -> None:
 
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
+
+    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
+    proxy_url = proxy_url or None
+
     total_queued = 0
+    blocked: list[str] = []
 
     for s in stores:
         click.echo(f"  Crawling {s['store_url']} ...")
-        item_urls = get_item_urls_from_store(
-            s["store_url"],
-            requests_per_second=settings.requests_per_second,
-        )
+        try:
+            item_urls = get_item_urls_from_store(
+                s["store_url"],
+                proxy_url=proxy_url,
+                requests_per_second=settings.requests_per_second,
+            )
+        except ChallengeError as exc:
+            blocked.append(s["store_url"])
+            click.echo(f"    BLOCKED: {exc}", err=True)
+            continue
         queued = enqueue_items(queue, redis_conn, item_urls, niche=s["niche"], store_url=s["store_url"])
         click.echo(f"    {len(item_urls)} items found, {queued} new jobs queued  [{s['niche']}]")
         total_queued += queued
 
     click.echo(f"\nDone. {total_queued} item jobs queued for workers.")
+    if blocked:
+        click.echo(
+            f"\n{len(blocked)} store(s) were blocked by eBay before the crawl "
+            f"completed and were NOT fully queued:", err=True,
+        )
+        for url in blocked:
+            click.echo(f"  - {url}", err=True)
+        click.echo(
+            "Set a rotating residential proxy (scraper proxy set <url>) and "
+            "re-run 'scraper scrape start' to finish them.", err=True,
+        )
 
 
 @scrape.command("stop")
@@ -564,9 +613,12 @@ def proxy_set(proxy_url: str) -> None:
     Workers read the proxy from Redis on every job, so this takes effect
     immediately across all VPS workers without restarting anything.
 
-    Note: use a sticky-session (session-pinned) residential proxy, not a
-    per-request rotating one. Per-request rotation means the eBay homepage
-    warmup and the item page hit different IPs, which can trigger detection.
+    Use a rotating residential proxy's plain endpoint (no sticky-session token).
+    eBay blocks any single IP after ~20-40 requests, so a fixed IP cannot crawl a
+    large store or feed multiple workers. The scraper rotates IPs itself: each item
+    scrape uses its own session (one fresh IP per item) and the store crawl rebuilds
+    its session every few pages, so each connection stays under eBay's per-IP limit.
+    Verify with 'scraper proxy test'.
     """
     settings = Settings()
     redis_conn = get_redis(settings.redis_url)
@@ -608,12 +660,21 @@ def proxy_test(item_url: str) -> None:
 
     masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
     click.echo(f"Testing proxy ...@{masked}")
-    result = scrape_item(item_url, proxy_url=proxy_url)
+    try:
+        result = scrape_item(item_url, proxy_url=proxy_url)
+    except ChallengeError:
+        click.echo("FAIL  eBay served a bot-challenge page through this proxy.")
+        click.echo("This is usually a datacenter IP. Use a rotating residential proxy.")
+        return
+    except Exception as exc:
+        click.echo(f"FAIL  Could not reach eBay through the proxy: {exc}")
+        click.echo("Check the proxy URL and that the proxy is reachable.")
+        return
     if result:
         click.echo(f"OK  Proxy working. Scraped: {result.title[:60]}")
     else:
-        click.echo("FAIL  eBay returned no data (bot challenge or 403).")
-        click.echo("Check the proxy URL and ensure it is a residential proxy.")
+        click.echo("FAIL  eBay returned no product data for this item (it may be ended/removed).")
+        click.echo("Try 'scraper proxy test --item-url <a live eBay item URL>'.")
 
 
 @proxy.command("status")

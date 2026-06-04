@@ -47,6 +47,13 @@ async def init_schema(pool: asyncpg.Pool) -> None:
             scraped_at   TIMESTAMPTZ DEFAULT now()
         )
     """)
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS stores (
+            store_url TEXT PRIMARY KEY,
+            niche     TEXT NOT NULL,
+            added_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
 
 async def insert_product(pool: asyncpg.Pool, record: ProductRecord) -> None:
@@ -92,3 +99,25 @@ async def get_counts(pool: asyncpg.Pool) -> dict[str, int]:
 
 async def clear_niche(pool: asyncpg.Pool, niche: str) -> None:
     await pool.execute("DELETE FROM products WHERE niche = $1", niche)
+
+
+async def add_store(pool: asyncpg.Pool, store_url: str, niche: str) -> None:
+    await pool.execute(
+        """
+        INSERT INTO stores (store_url, niche)
+        VALUES ($1, $2)
+        ON CONFLICT (store_url) DO UPDATE SET niche = EXCLUDED.niche
+        """,
+        store_url, niche,
+    )
+
+
+async def list_stores(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+    return await pool.fetch(
+        "SELECT store_url, niche, added_at FROM stores ORDER BY added_at"
+    )
+
+
+async def remove_store(pool: asyncpg.Pool, store_url: str) -> bool:
+    result = await pool.execute("DELETE FROM stores WHERE store_url = $1", store_url)
+    return result.split()[-1] == "1"

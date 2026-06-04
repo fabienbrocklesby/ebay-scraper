@@ -7,6 +7,20 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from scraper.fetch import ChallengeError, apply_proxy_country, build_session, is_challenge_page
+
+
+def _clean_text(raw: str) -> str:
+    """Normalise an eBay JSON-LD text value.
+
+    eBay's JSON-LD `name` arrives with HTML entities (e.g. &#034;) and stray
+    inline tags (e.g. <wbr> word-break hints). Parsing it as HTML strips the
+    tags and decodes the entities in one pass, yielding clean CSV text.
+    """
+    if not raw:
+        return ""
+    return BeautifulSoup(raw, "html.parser").get_text()
+
 
 @dataclass
 class ProductData:
@@ -139,7 +153,7 @@ def scrape_item(
     proxy_url: Optional[str] = None,
     client: Optional[Any] = None,
 ) -> Optional[ProductData]:
-    """Fetch an eBay item page and return structured product data, or None on failure.
+    """Fetch an eBay item page and return structured product data.
 
     Accepts a full item URL (e.g. https://www.ebay.com.au/itm/123456789) so that
     non-US eBay domains are handled correctly.
@@ -151,17 +165,23 @@ def scrape_item(
     establishes session cookies before the item page fetch.
 
     Pass client explicitly only in tests (inject an httpx.Client for respx mocking).
+
+    Returns None only when the item genuinely yields no data (404, or a page with
+    no parseable product block). A bot-challenge or transport/server error is
+    raised, not swallowed: returning None would make rq record the job as a
+    successful empty scrape and drop the item silently.
+
+    Raises:
+        ChallengeError: eBay served a bot-verification page (HTTP 200) instead of
+            the item. The job should be retried later or on a fresh proxy IP.
+        Exception: transport error or 5xx, so rq can retry the job.
     """
     parsed = urlparse(item_url)
     homepage = f"{parsed.scheme}://{parsed.netloc}/"
     own_client = client is None
 
     if own_client:
-        from curl_cffi.requests import Session
-        session_kwargs: dict[str, Any] = {"impersonate": "chrome131"}
-        if proxy_url:
-            session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-        client = Session(**session_kwargs)
+        client = build_session(apply_proxy_country(proxy_url, item_url))
 
     try:
         if own_client:
@@ -184,6 +204,9 @@ def scrape_item(
             return None
         response.raise_for_status()
 
+        if is_challenge_page(response.text):
+            raise ChallengeError(f"eBay challenge fetching item {item_url}")
+
         soup = BeautifulSoup(response.text, "html.parser")
         ld_json = _find_product_ld(soup)
         if not ld_json:
@@ -203,7 +226,7 @@ def scrape_item(
 
         return ProductData(
             item_id=item_id,
-            title=ld_json.get("name", ""),
+            title=_clean_text(ld_json.get("name", "")),
             price=float(offers.get("price", 0) or 0),
             currency=offers.get("priceCurrency", ""),
             condition=_condition_from_schema(offers.get("itemCondition", "")),
@@ -218,8 +241,6 @@ def scrape_item(
             shipping=_extract_shipping(soup),
             listing_type=_extract_listing_type(soup),
         )
-    except Exception:
-        return None
     finally:
         if own_client and client:
             client.close()

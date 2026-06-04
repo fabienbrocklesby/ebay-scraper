@@ -6,7 +6,9 @@ A distributed eBay product scraper built for Kieran Granger. Scrapes full produc
 
 ## Status
 
-**Not yet implemented.** Spec and implementation plan are written. No source code exists yet. Start from Task 1 of the plan.
+**Implemented and validated against live eBay.** All modules in `scraper/` exist with passing tests (`pytest`, 47 tests). The full CLI chain (coordinator services, store add, scrape start, worker, export) has been run end to end. See `README.md` for the user-facing setup and usage guide.
+
+Key hard-won behaviour to preserve: eBay serves bot-challenge pages with **HTTP 200** (titles "Security Measure" and "Pardon Our Interruption"). These are detected in `scraper/fetch.py` (`is_challenge_page`) and must never be read as "no more data" - doing so silently truncates store crawls and drops items. On a challenge the store crawl raises `ChallengeError` (loud, with a partial count) and item jobs raise so rq retries them. Workers and large-store crawls require a **rotating residential proxy**; a single static IP is blocked by eBay after ~20-40 requests.
 
 ## Implementation Plan
 
@@ -65,7 +67,7 @@ This tool will run unsupervised in production for years. There is no maintenance
 
 - **Coordinator VPS**: runs Redis (rq job queue) + Postgres (results)
 - **Worker VPS nodes** (as many as needed): pull item IDs from Redis, scrape eBay, write to Postgres
-- **CLI**: `scraper add <store-url> --niche <tag>` / `scraper worker start` / `scraper export`
+- **CLI**: `scraper store add <store-url> --niche <tag>` then `scraper scrape start` (crawl + queue) / `scraper init <coordinator-ip>` (one-command worker VPS setup) / `scraper export`. Full command reference in `README.md`.
 - Horizontal scaling: add more VPS workers, no code changes needed
 
 ## Tech Stack
