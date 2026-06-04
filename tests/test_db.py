@@ -66,3 +66,13 @@ async def test_get_counts_groups_by_niche(db_pool):
     await insert_product(db_pool, make_record(item_id="cnt2", niche="counted"))
     counts = await get_counts(db_pool)
     assert counts["counted"] == 2
+
+
+@pytest.mark.asyncio
+async def test_products_table_has_delta_columns(db_pool):
+    rows = await db_pool.fetch(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='products'"
+    )
+    cols = {r["column_name"] for r in rows}
+    assert "last_seen_at" in cols
+    assert "is_active" in cols

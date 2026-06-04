@@ -44,9 +44,17 @@ async def init_schema(pool: asyncpg.Pool) -> None:
             shipping     TEXT,
             listing_type TEXT,
             niche        TEXT,
-            scraped_at   TIMESTAMPTZ DEFAULT now()
+            scraped_at   TIMESTAMPTZ DEFAULT now(),
+            last_seen_at TIMESTAMPTZ DEFAULT now(),
+            is_active    BOOLEAN DEFAULT true
         )
     """)
+    await pool.execute(
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT now()"
+    )
+    await pool.execute(
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true"
+    )
     await pool.execute("""
         CREATE TABLE IF NOT EXISTS stores (
             store_url TEXT PRIMARY KEY,
