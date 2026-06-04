@@ -155,3 +155,25 @@ def test_recovers_from_transient_challenge(monkeypatch):
 
     assert urls == ["https://www.ebay.com/itm/555"]
     assert behaviours == []
+
+
+def test_normalize_sch_url_keeps_seller_search():
+    from scraper.store import _normalize_store_url
+    url = "https://www.ebay.com/sch/i.html?_ssn=redtiger_store&store_name=vlrd5820&_oac=1"
+    assert _normalize_store_url(url) == "https://www.ebay.com/sch/i.html?_ssn=redtiger_store"
+
+
+def test_page_url_appends_to_existing_query():
+    from scraper.store import _page_url
+    assert _page_url("https://www.ebay.com/str/x", 1) == "https://www.ebay.com/str/x?_pgn=1&_ipg=240"
+    sch = _page_url("https://www.ebay.com/sch/i.html?_ssn=redtiger_store", 2)
+    assert sch == "https://www.ebay.com/sch/i.html?_ssn=redtiger_store&_pgn=2&_ipg=240"
+
+
+def test_extract_item_urls_general_fallback_for_search_pages():
+    from scraper.store import _extract_item_urls
+    html = ('<div><a href="https://www.ebay.com/itm/123456789012?hash=z">a</a>'
+            '<a href="https://www.ebay.com/itm/987654321098">b</a></div>')
+    urls = _extract_item_urls(html)
+    assert "https://www.ebay.com/itm/123456789012" in urls
+    assert "https://www.ebay.com/itm/987654321098" in urls

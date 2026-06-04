@@ -19,21 +19,6 @@ _ITEMS_PER_PAGE = 240
 _PAGES_PER_SESSION = 10
 
 
-def _sch_to_str_url(url: str) -> str | None:
-    """Convert an eBay /sch/ seller-filtered URL to the equivalent /str/ store URL.
-
-    eBay's /sch/ endpoint returns 403 to non-browser clients. The /str/ store
-    pages are accessible and use a.str-item-card__link for item links.
-    """
-    parsed = urlparse(url)
-    if "/sch/" not in parsed.path:
-        return None
-    ssn = parse_qs(parsed.query).get("_ssn", [None])[0]
-    if not ssn:
-        return None
-    return f"{parsed.scheme}://{parsed.netloc}/str/{ssn}"
-
-
 def extract_seller_id(store_url: str) -> str:
     path = urlparse(store_url).path.strip("/")
     parts = path.split("/")
@@ -45,8 +30,19 @@ def extract_seller_id(store_url: str) -> str:
 
 
 def _normalize_store_url(store_url: str) -> str:
-    """Return canonical store URL: scheme+host+path, no trailing slash, no query params."""
+    """Return a canonical crawl URL for a store or seller-search input.
+
+    A /str/ store page becomes scheme+host+path with no trailing slash or query.
+    A /sch/ seller-search URL is kept as a seller search keyed on the seller name
+    (_ssn), because a seller's store name can differ from their username, so
+    converting to /str/{username} can land on a dead page. The seller search lists
+    all of that seller's items regardless of how their store is named.
+    """
     parsed = urlparse(store_url)
+    if "/sch/" in parsed.path:
+        ssn = parse_qs(parsed.query).get("_ssn", [None])[0]
+        if ssn:
+            return f"{parsed.scheme}://{parsed.netloc}/sch/i.html?_ssn={ssn}"
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
 
 
@@ -56,14 +52,17 @@ def _homepage_url(store_url: str) -> str:
 
 
 def _page_url(base_store_url: str, page: int) -> str:
-    return f"{base_store_url}?_pgn={page}&_ipg={_ITEMS_PER_PAGE}"
+    sep = "&" if "?" in base_store_url else "?"
+    return f"{base_store_url}{sep}_pgn={page}&_ipg={_ITEMS_PER_PAGE}"
 
 
 def _extract_item_urls(html: str) -> list[str]:
-    """Extract clean item URLs from a store listing page.
+    """Extract clean item URLs from a listing page, deduped, query stripped.
 
-    eBay store pages use a.str-item-card__link for item links.
-    Returns URLs with query params stripped, deduped by URL.
+    Store pages use a.str-item-card__link. Seller-search pages and storefront
+    variants use different markup, so when the store-card selector finds nothing,
+    fall back to every /itm/ link on the page. This keeps discovery working for
+    any seller URL the user adds, not just standard /str/ store grids.
     """
     soup = BeautifulSoup(html, "html.parser")
     seen: dict[str, None] = {}
@@ -72,6 +71,9 @@ def _extract_item_urls(html: str) -> list[str]:
         m = re.search(r"(https?://[^/?#]+/itm/\d+)", href)
         if m:
             seen[m.group(1)] = None
+    if not seen:
+        for m in re.finditer(r"https?://[^/?#\"']+/itm/(\d{11,13})", html):
+            seen[f"https://{urlparse(m.group(0)).netloc}/itm/{m.group(1)}"] = None
     return list(seen.keys())
 
 
@@ -286,9 +288,6 @@ def get_item_urls_from_store(
     Raises:
         ChallengeError: eBay blocked the crawl and it could not be completed.
     """
-    converted = _sch_to_str_url(store_url)
-    if converted:
-        store_url = converted
     base_store_url = _normalize_store_url(store_url)
     homepage = _homepage_url(store_url)
     delay = 1.0 / requests_per_second if requests_per_second > 0 else 2.0

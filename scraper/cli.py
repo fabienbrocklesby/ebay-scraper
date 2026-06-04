@@ -17,7 +17,7 @@ from scraper.export import export_to_csv
 from scraper.fetch import ChallengeError
 from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
-from scraper.store import _sch_to_str_url, _normalize_store_url, get_item_urls_from_store
+from scraper.store import _normalize_store_url, get_item_urls_from_store
 from scraper.worker import start_worker
 
 _CONFIG_DIR = Path.home() / ".config" / "ebay-scraper"
@@ -408,8 +408,7 @@ def store() -> None:
 
 
 def _canonical_store_url(url: str) -> str:
-    converted = _sch_to_str_url(url)
-    return _normalize_store_url(converted if converted else url)
+    return _normalize_store_url(url)
 
 
 def _parse_store_lines(text: str, default_niche: str | None) -> list[tuple[str, str]]:
