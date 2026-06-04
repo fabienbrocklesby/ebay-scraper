@@ -3,6 +3,18 @@ import respx
 import httpx
 from scraper.fetch import ChallengeError
 from scraper.store import extract_seller_id, _normalize_store_url, _extract_item_urls, get_item_urls_from_store
+from scraper.store import _price_partitions
+
+
+def test_price_partitions_splits_range():
+    parts = _price_partitions(0, 1000, splits=4)
+    assert parts == [(0, 250), (250, 500), (500, 750), (750, 1000)]
+
+
+def test_price_partition_url_params():
+    from scraper.store import _partition_url
+    u = _partition_url("https://www.ebay.com.au/str/x", 250, 500)
+    assert "_udlo=250" in u and "_udhi=500" in u
 
 
 def test_extract_seller_id_from_str_url():

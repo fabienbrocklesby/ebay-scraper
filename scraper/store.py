@@ -137,6 +137,53 @@ def _recover_from_challenge(
     )
 
 
+# eBay stops paginating store/search browse around 10 000 results. When a crawl
+# hits this ceiling, re-crawling the same store filtered by non-overlapping price
+# bands recovers items that browse pagination hides.
+_BROWSE_CEILING = 10000
+
+
+def _price_partitions(lo: float, hi: float, splits: int = 4) -> list[tuple[float, float]]:
+    """Divide [lo, hi) into `splits` equal sub-ranges for price-filtered re-crawls."""
+    step = (hi - lo) / splits
+    return [(round(lo + step * i, 2), round(lo + step * (i + 1), 2)) for i in range(splits)]
+
+
+def _partition_url(base_store_url: str, lo: float, hi: float) -> str:
+    """Append eBay price-range filter params to a store URL."""
+    sep = "&" if "?" in base_store_url else "?"
+    return f"{base_store_url}{sep}_udlo={lo}&_udhi={hi}"
+
+
+def _crawl_pages(
+    client: Any,
+    base_url: str,
+    homepage: str,
+    max_pages: int,
+    delay: float,
+) -> list[str]:
+    """Fetch listing pages for `base_url` (already has any filter params) and return item URLs.
+
+    Simplified inner loop used by both the normal crawl path and the partitioned
+    re-crawl path. Does NOT handle challenges or session rotation; callers that need
+    robustness should use get_item_urls_from_store directly.
+    """
+    seen: dict[str, None] = {}
+    page = 1
+    while page <= max_pages:
+        page_url = _page_url(base_url, page)
+        html = _fetch_listing_page(client, page_url, homepage)
+        if html is None or is_challenge_page(html):
+            break
+        for url in _extract_item_urls(html):
+            seen[url] = None
+        if not _has_next_page(html):
+            break
+        time.sleep(delay)
+        page += 1
+    return list(seen.keys())
+
+
 _ITM_RE = re.compile(r"/itm/(\d{11,13})")
 _PRICE_RE = re.compile(r"[\d][\d,]*\.\d{2}")
 
@@ -285,5 +332,20 @@ def get_item_urls_from_store(
     finally:
         if own_client:
             client.close()
+
+    # When the normal crawl hits eBay's browse ceiling (~10 000 results), the
+    # result set is artificially truncated. Re-crawl with non-overlapping price
+    # bands to recover hidden items. One level of partitioning is enough in
+    # practice; recursion is not needed and is deliberately avoided.
+    # Skip when _session is injected (unit tests) to keep tests simple.
+    if own_client and len(seen) >= _BROWSE_CEILING:
+        extra_client = build_session(proxy_url)
+        try:
+            for lo, hi in _price_partitions(0, _BROWSE_CEILING):
+                part_base = _partition_url(base_store_url, lo, hi)
+                for url in _crawl_pages(extra_client, part_base, homepage, max_pages, delay):
+                    seen[url] = None
+        finally:
+            extra_client.close()
 
     return list(seen.keys())
