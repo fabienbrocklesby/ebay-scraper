@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from scraper.fetch import ChallengeError, apply_proxy_country, build_session, is_challenge_page
+from scraper.fetch import (
+    ChallengeError,
+    WrongCountryError,
+    apply_proxy_country,
+    build_session,
+    expected_currency,
+    is_challenge_page,
+)
 
 
 def _clean_text(raw: str) -> str:
@@ -224,11 +231,19 @@ def scrape_item(
         item_id = _item_id_from_url(item_url)
         description = _fetch_description(soup, client, item_url)
 
+        currency = offers.get("priceCurrency", "")
+        expected = expected_currency(item_url)
+        if proxy_url and expected and currency and currency != expected:
+            raise WrongCountryError(
+                f"{item_url} returned {currency}, expected {expected} - proxy IP "
+                f"resolved to the wrong country; retrying on a fresh IP"
+            )
+
         return ProductData(
             item_id=item_id,
             title=_clean_text(ld_json.get("name", "")),
             price=float(offers.get("price", 0) or 0),
-            currency=offers.get("priceCurrency", ""),
+            currency=currency,
             condition=_condition_from_schema(offers.get("itemCondition", "")),
             description=description,
             image_urls="|".join(images),

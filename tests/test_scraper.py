@@ -2,7 +2,7 @@ import json
 import pytest
 import respx
 import httpx
-from scraper.fetch import ChallengeError
+from scraper.fetch import ChallengeError, WrongCountryError
 from scraper.scraper import scrape_item, ProductData
 
 ITEM_URL = "https://www.ebay.com/itm/123456789"
@@ -167,6 +167,28 @@ def test_scrape_item_cleans_entities_and_tags_in_title():
     client = httpx.Client(follow_redirects=True)
     product = scrape_item(ITEM_URL, client=client)
     assert product.title == "Brake Pads 3/8\" Showroom 50'"
+
+
+@respx.mock
+def test_scrape_item_raises_on_wrong_country_currency():
+    """A foreign currency (wrong-country exit IP) must retry, not store bad prices."""
+    brl_html = SAMPLE_HTML.replace('"priceCurrency": "USD"', '"priceCurrency": "BRL"')
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=brl_html))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
+    client = httpx.Client(follow_redirects=True)
+    with pytest.raises(WrongCountryError):
+        scrape_item(ITEM_URL, proxy_url="http://u:p@geo.iproyal.com:12321", client=client)
+
+
+@respx.mock
+def test_scrape_item_allows_foreign_currency_without_proxy():
+    """Without a proxy the local IP's currency is legitimate, so no retry is forced."""
+    brl_html = SAMPLE_HTML.replace('"priceCurrency": "USD"', '"priceCurrency": "BRL"')
+    respx.get(ITEM_URL).mock(return_value=httpx.Response(200, text=brl_html))
+    respx.get(DESC_URL).mock(return_value=httpx.Response(200, text=DESC_HTML))
+    client = httpx.Client(follow_redirects=True)
+    product = scrape_item(ITEM_URL, client=client)
+    assert product.currency == "BRL"
 
 
 @respx.mock

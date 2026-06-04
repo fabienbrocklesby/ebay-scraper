@@ -12,6 +12,16 @@ class ChallengeError(Exception):
     """
 
 
+class WrongCountryError(ChallengeError):
+    """The proxy exit IP resolved to the wrong country for the eBay site.
+
+    eBay prices by the viewer's location, so a foreign exit IP returns converted,
+    foreign-currency prices (e.g. BRL on ebay.com from a Brazil IP). Storing that
+    would corrupt the price data. It subclasses ChallengeError so it is retried the
+    same way: a fresh IP should land in the correct country.
+    """
+
+
 # eBay serves at least two distinct bot interstitials, both with HTTP 200:
 #   1. "Security Measure | eBay" - explicit "verify yourself" page.
 #   2. "Pardon Our Interruption..." - a "checking your browser" redirect page.
@@ -71,6 +81,17 @@ _EBAY_TLD_TO_COUNTRY = {
 }
 
 
+# The currency each eBay site shows to an in-country viewer. Used to catch a proxy
+# exit IP that leaked into the wrong country (eBay then returns converted foreign
+# prices), so that item can be retried on a fresh IP instead of stored wrong.
+_COUNTRY_TO_CURRENCY = {
+    "us": "USD", "au": "AUD", "gb": "GBP", "ca": "CAD", "ch": "CHF",
+    "pl": "PLN", "ph": "PHP", "sg": "SGD", "my": "MYR", "hk": "HKD",
+    "de": "EUR", "fr": "EUR", "it": "EUR", "es": "EUR", "nl": "EUR",
+    "be": "EUR", "at": "EUR", "ie": "EUR",
+}
+
+
 def _ebay_country_code(target_url: str) -> Optional[str]:
     host = urlparse(target_url).netloc.lower()
     marker = "ebay."
@@ -79,6 +100,12 @@ def _ebay_country_code(target_url: str) -> Optional[str]:
         return None
     suffix = host[idx + len(marker):]
     return _EBAY_TLD_TO_COUNTRY.get(suffix)
+
+
+def expected_currency(target_url: str) -> Optional[str]:
+    """The currency an eBay site should report to an in-country viewer, if known."""
+    country = _ebay_country_code(target_url)
+    return _COUNTRY_TO_CURRENCY.get(country) if country else None
 
 
 def apply_proxy_country(proxy_url: Optional[str], target_url: str) -> Optional[str]:

@@ -1,4 +1,4 @@
-from scraper.fetch import apply_proxy_country, is_challenge_page
+from scraper.fetch import apply_proxy_country, expected_currency, is_challenge_page
 
 _IPROYAL = "http://user:pass@geo.iproyal.com:12321"
 
@@ -59,3 +59,14 @@ def test_apply_proxy_country_passthrough_when_no_proxy():
 
 def test_apply_proxy_country_unknown_domain_unchanged():
     assert apply_proxy_country(_IPROYAL, "https://example.com/x") == _IPROYAL
+
+
+def test_expected_currency_known_sites():
+    assert expected_currency("https://www.ebay.com/itm/1") == "USD"
+    assert expected_currency("https://www.ebay.com.au/itm/1") == "AUD"
+    assert expected_currency("https://www.ebay.co.uk/itm/1") == "GBP"
+    assert expected_currency("https://www.ebay.de/itm/1") == "EUR"
+
+
+def test_expected_currency_unknown_site():
+    assert expected_currency("https://example.com/x") is None
