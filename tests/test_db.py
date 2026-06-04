@@ -1,5 +1,13 @@
 import pytest
-from scraper.db import insert_product, get_products_by_niche, get_counts, clear_niche, ProductRecord
+from scraper.db import (
+    insert_product,
+    get_products_by_niche,
+    get_counts,
+    clear_niche,
+    get_store_item_prices,
+    mark_items_inactive,
+    ProductRecord,
+)
 
 
 def make_record(**kwargs) -> ProductRecord:
@@ -66,6 +74,19 @@ async def test_get_counts_groups_by_niche(db_pool):
     await insert_product(db_pool, make_record(item_id="cnt2", niche="counted"))
     counts = await get_counts(db_pool)
     assert counts["counted"] == 2
+
+
+@pytest.mark.asyncio
+async def test_store_item_prices_and_deactivate(db_pool):
+    await insert_product(db_pool, make_record(item_id="111111111111", price=10.0, store_url="https://s"))
+    await insert_product(db_pool, make_record(item_id="222222222222", price=20.0, store_url="https://s"))
+    prices = await get_store_item_prices(db_pool, "https://s")
+    assert prices == {"111111111111": 10.0, "222222222222": 20.0}
+
+    n = await mark_items_inactive(db_pool, "https://s", ["222222222222"])
+    assert n == 1
+    prices_after = await get_store_item_prices(db_pool, "https://s")
+    assert "222222222222" not in prices_after
 
 
 @pytest.mark.asyncio

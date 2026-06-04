@@ -129,3 +129,21 @@ async def list_stores(pool: asyncpg.Pool) -> list[asyncpg.Record]:
 async def remove_store(pool: asyncpg.Pool, store_url: str) -> bool:
     result = await pool.execute("DELETE FROM stores WHERE store_url = $1", store_url)
     return result.split()[-1] == "1"
+
+
+async def get_store_item_prices(pool: asyncpg.Pool, store_url: str) -> dict[str, float]:
+    rows = await pool.fetch(
+        "SELECT item_id, price FROM products WHERE store_url = $1 AND is_active = true",
+        store_url,
+    )
+    return {r["item_id"]: float(r["price"]) for r in rows if r["price"] is not None}
+
+
+async def mark_items_inactive(pool: asyncpg.Pool, store_url: str, item_ids: list[str]) -> int:
+    if not item_ids:
+        return 0
+    result = await pool.execute(
+        "UPDATE products SET is_active = false WHERE store_url = $1 AND item_id = ANY($2::text[])",
+        store_url, item_ids,
+    )
+    return int(result.split()[-1])
