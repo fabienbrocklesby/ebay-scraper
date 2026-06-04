@@ -1,0 +1,16 @@
+# deploy/ebay-worker.service
+[Unit]
+Description=eBay scraper rq worker (one per box; per-IP rate is governed in-process)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/ebay-scraper/.env
+ExecStart=/usr/local/bin/scraper worker start
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
