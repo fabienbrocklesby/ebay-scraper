@@ -388,6 +388,11 @@ def worker_docker_run(image: str) -> None:
         f"  -e DATABASE_URL={settings.database_url} \\\n"
         f"  -e PROXY_URL={proxy} \\\n"
         f"  -e REQUESTS_PER_SECOND={settings.requests_per_second} \\\n"
+        f"  -e WORKER_CONCURRENCY={settings.worker_concurrency} \\\n"
+        f"  -e MAX_RPS_PER_IP={settings.max_rps_per_ip} \\\n"
+        f"  -e BATCH_SIZE={settings.batch_size} \\\n"
+        f"  -e CHALLENGE_ESCALATION_THRESHOLD={settings.challenge_escalation_threshold} \\\n"
+        f"  -e CHALLENGE_COOLDOWN_SECONDS={settings.challenge_cooldown_seconds} \\\n"
         f"  {image}"
     )
 
