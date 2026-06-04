@@ -212,8 +212,17 @@ def crawl_store(store_url: str, niche: str) -> None:
 
 def start_worker(redis_url: str) -> None:
     """Start an rq worker listening on the 'scraping' queue."""
+    import os
+    import sys
     import redis as redis_lib
     from rq import Worker
+
+    # rq forks a work-horse per job. On macOS, forking after the Objective-C
+    # runtime has initialized aborts with an NSCharacterSet fork-safety error,
+    # which kills every job. This env var restores the pre-Catalina fork behaviour
+    # and is the standard fix; it is a no-op on Linux, where workers normally run.
+    if sys.platform == "darwin":
+        os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
     conn = redis_lib.from_url(redis_url)
     worker = Worker(["scraping"], connection=conn)
