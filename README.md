@@ -19,20 +19,42 @@ scraping in parallel. Adding more workers increases speed with no code changes.
             ┌───────────────────┼───────────────────┐
             ▼                   ▼                   ▼
       ┌───────────┐       ┌───────────┐       ┌───────────┐
-      │ Linux VPS │       │ Linux VPS │  ...  │ Linux VPS │
-      │  worker   │       │  worker   │       │  worker   │
+      │  worker    │      │  worker    │ ...   │  worker    │
+      │ (a box     │      │ (a box     │       │ (a box     │
+      │  with an   │      │  with an   │       │  with an   │
+      │  IP)       │      │  IP)       │       │  IP)       │
       └───────────┘       └───────────┘       └───────────┘
-        all workers scrape eBay through one rotating residential proxy
+   each worker fetches in parallel; add boxes to go faster
 ```
 
-Two things are required for it to work reliably, and both are explained below:
+Each worker pulls item jobs from the queue and fetches the detail pages in
+parallel (many at once per box, with a built-in per-IP rate limit). Adding more
+worker boxes multiplies throughput with no code change.
 
-1. **Tailscale** — a free private network so the workers can reach the
-   coordinator's Redis/Postgres without exposing them to the internet.
-2. **A rotating residential proxy** — eBay blocks any single IP address after a
-   few dozen requests. A rotating residential proxy gives every request a fresh
-   IP, which is what lets you scrape a whole store and run many workers. See
-   [Proxy setup](#proxy-setup-required). This is not optional for real use.
+**The one thing that decides your cost is what kind of IP your worker boxes have.**
+This was measured against live eBay, and it matters a lot:
+
+- **Worker on a residential IP** (a home PC, an office connection, a
+  residential-IP box): eBay serves it directly. No proxy, **no per-GB bandwidth
+  cost**, fast. This is the cheap path and the way to do millions/day without
+  spending much. It is what Kieran's original home-PC script was already doing,
+  just scaled up. Measured: ~6-7 items/sec per box at the safe default rate
+  (~550k/day/box), tunable higher, free.
+- **Worker on a datacenter/VPS IP** (Hetzner, DigitalOcean, Vultr, etc.): eBay
+  blocks those IPs with a 403, so the worker must fetch through a **rotating
+  residential proxy**, and every ~0.8 MB detail page then costs proxy bandwidth.
+  Reliable, scales by adding boxes, but you pay per GB. Use this for burst
+  capacity, not for a giant one-time backfill.
+
+The worker handles both automatically: it tries its own IP first and only falls
+back to the proxy when eBay blocks it. So the same build runs free on a
+residential box and via-proxy on a datacenter box. Set the proxy once on the
+coordinator (below) and it is there as the fallback whenever a box needs it.
+
+Also required regardless of topology:
+
+- **Tailscale** — a free private network so the workers can reach the
+  coordinator's Redis/Postgres without exposing them to the internet.
 
 ---
 
@@ -173,14 +195,22 @@ scraper coordinator info
 
 ---
 
-## Proxy setup (required)
+## Proxy setup (the fallback)
 
-eBay challenges any single IP address after roughly 20-40 requests and then
-blocks it for about ten minutes. To scrape a full store and to run more than one
-worker, every request needs a fresh IP. That is what a **rotating residential
-proxy** does: you buy one plan, and a single endpoint rotates you through a large
-pool of IP addresses. You are billed by bandwidth (per GB), not per IP, so you do
-not buy "lots of proxies" — you buy one account.
+Set a rotating residential proxy on the coordinator. It is the safety net the
+whole system leans on: datacenter/VPS worker IPs are blocked by eBay and fetch
+through it, residential worker boxes fall back to it only if their own IP gets
+challenged, and the coordinator uses it if its IP is challenged while crawling a
+big store. If all your worker boxes are residential and never get challenged, the
+proxy may go almost unused, but set it anyway so nothing stalls when a block
+happens.
+
+A **rotating residential proxy** is one plan with a single endpoint that rotates
+you through a large pool of real residential IPs. You are billed by bandwidth
+(per GB), not per IP, so you buy one account, not "lots of proxies". Because
+datacenter boxes route every page through it, proxy bandwidth is the main running
+cost on a datacenter topology (about 1 GB per 1,000 items); residential-IP
+workers avoid that cost.
 
 ### Recommended: IPRoyal (pay-as-you-go, no monthly commitment)
 
@@ -329,7 +359,7 @@ scraper store list
 A `/str/` or `/sch/` seller URL both work; the tool converts to the canonical
 store URL. The `--niche` tag groups items so you can export them separately later.
 
-### Start scraping
+### Start scraping (backfill)
 
 ```bash
 scraper scrape start                 # crawl all registered stores
@@ -337,9 +367,49 @@ scraper scrape start --niche car-parts   # only that niche
 ```
 
 This crawls each store's pages on the coordinator, finds every item, and queues
-the items as jobs. The workers scrape them. If eBay blocks a store mid-crawl, the
-command says so clearly and tells you which stores to re-run after the proxy
-cools down (it does not silently return a partial list).
+the items as jobs in batches. The workers scrape them. If eBay blocks a store
+mid-crawl, the command says so clearly and tells you which stores to re-run after
+the proxy cools down (it does not silently return a partial list).
+
+### Keep it fresh cheaply (delta)
+
+After the first backfill of a store, you do not need to re-scrape everything to
+stay current. `scrape delta` re-reads only the cheap listing pages (about 200
+items per request), compares them to what is already in the database, and:
+
+- queues a detail scrape for **new** items and items whose **price changed**,
+- marks items that have **disappeared** from the store as inactive,
+- skips everything unchanged (no detail-page fetch, no cost).
+
+```bash
+scraper scrape delta                   # delta-scan all stores
+scraper scrape delta --niche car-parts # only that niche
+```
+
+The intended rhythm: run `scrape start` once per store to build the catalogue,
+then run `scrape delta` on a schedule (for example a daily cron on the
+coordinator) to keep it current for almost nothing. This is what keeps ongoing
+cost tiny even when the initial catalogue is large.
+
+### Tuning a worker box (throughput vs blocks)
+
+Each worker box governs its own outbound rate. The defaults are conservative and
+safe; raise them per box once you see how its IP behaves. Set these as
+environment variables on the worker (they are also emitted by
+`scraper worker docker-run`):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `WORKER_CONCURRENCY` | `8` | How many items the box fetches in parallel |
+| `MAX_RPS_PER_IP` | `6` | Hard cap on items/sec for the box's IP (the main throttle) |
+| `BATCH_SIZE` | `200` | Items per queued job |
+| `CHALLENGE_ESCALATION_THRESHOLD` | `0.15` | Fraction of recent fetches blocked before the box switches itself to the proxy |
+| `CHALLENGE_COOLDOWN_SECONDS` | `120` | How long it stays on the proxy after switching, before probing direct again |
+
+On a residential box, raising `MAX_RPS_PER_IP` and `WORKER_CONCURRENCY` is how you
+push a single box toward and past a million items/day; back off if you start
+seeing blocks. On a datacenter box, the defaults route through the proxy
+automatically.
 
 ### Check progress
 
@@ -435,7 +505,8 @@ scrape again refreshes prices rather than creating duplicates.
 | `scraper store add <url> --niche <tag>` | coordinator | Register a store |
 | `scraper store list` | coordinator | List registered stores |
 | `scraper store remove <url>` | coordinator | Unregister a store |
-| `scraper scrape start [--niche <tag>]` | coordinator | Crawl stores, queue item jobs |
+| `scraper scrape start [--niche <tag>]` | coordinator | Backfill: crawl stores, queue all item jobs |
+| `scraper scrape delta [--niche <tag>]` | coordinator | Re-scan listings, queue only new/changed items, mark gone ones inactive |
 | `scraper scrape status` | coordinator | Show progress |
 | `scraper scrape stop` | coordinator | Cancel pending jobs |
 | `scraper export [--niche <tag>] --output <file>` | coordinator | Write CSV |
@@ -487,12 +558,22 @@ pipx reinstall ebay-scraper
   exposing items after roughly 10,000 per store. For stores bigger than that you
   cannot get every single item through pagination — that is an eBay limit, not a
   bug here. Most seller stores are well under it.
-- **Throughput depends entirely on the proxy.** With a real rotating residential
-  pool you can run many workers in parallel. With a single static IP (no
-  rotation) eBay will block it quickly and large crawls will fail loudly with a
-  clear message. The tool never pretends a blocked crawl succeeded.
-- **Bandwidth costs money.** Each item page is roughly 0.5-1 MB. Budget proxy
-  bandwidth accordingly (about 1 GB per 1,000 items).
+- **Throughput scales with worker boxes.** Each box runs at its `MAX_RPS_PER_IP`
+  cap (default 6 items/sec ≈ 550k/day). Add boxes, or raise the cap on a
+  residential box, to reach millions/day. Measured live: ~6-7 items/sec/box on a
+  residential IP at the default, 200/200 items per batch with no blocks.
+- **Cost depends on worker IP type, not on the tool.** On residential-IP boxes
+  the detail fetches are direct and free, so a large one-time backfill costs
+  essentially nothing but time. On datacenter/VPS boxes the same fetches go
+  through the residential proxy and cost bandwidth: each item page is roughly
+  0.8-1 MB, so budget about 1 GB per 1,000 items of proxy traffic. The cheap way
+  to do a big backfill is residential-IP workers; reserve datacenter+proxy boxes
+  for burst capacity. After backfill, `scrape delta` keeps things current for
+  almost nothing on either topology.
+- **The store crawl (discovery) runs on the coordinator.** If the coordinator's
+  own IP gets challenged while crawling a large store's listing pages, set the
+  proxy (`scraper proxy set`) so discovery routes through it too; the crawl fails
+  loudly rather than returning a partial list.
 
 ---
 
