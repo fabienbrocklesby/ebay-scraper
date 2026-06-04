@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Lift the eBay scraper from ~2 items/min/box to tens of items/sec/box, keep running cost inside ~$100-300/mo by fetching on the box's own IP and escalating to residential proxy only on challenge, and add a cheap delta mode so steady-state re-scraping only re-fetches new or changed items. Ship it tested on real infra and ready to hand to Kieran.
+**Goal:** Lift the eBay scraper from ~2 items/min/box to several items/sec/box (~3/s at safe defaults, ~130x the old rate, since each item is 2 requests and the per-IP cap defaults to 6 req/s), with throughput scaling linearly by adding boxes. Keep running cost inside ~$100-300/mo by fetching on the box's own IP and escalating to residential proxy only on challenge, and add a cheap delta mode so steady-state re-scraping only re-fetches new or changed items. Ship it tested on real infra and ready to hand to Kieran.
 
 **Architecture:** The unit of work changes from one item per rq job to a batch of ~200 item URLs per rq job, fetched concurrently inside the job with a thread pool, rate-limited by a shared per-IP token bucket, and bulk-upserted to Postgres. Each box runs exactly one rq worker process (its single IP is governed by the token bucket); scale = more boxes. Discovery and delta read eBay store listing pages (~200 items/request). Residential proxy is a challenge-triggered fallback, not the default path.
 
@@ -491,11 +491,13 @@ git commit -m "feat: sync bulk upsert for batched worker writes"
 
 ## Phase C: Batched concurrent worker
 
-### Task C1: Per-item fetch with escalation
+### Task C1: Per-item fetch with escalation (inject session to kill warmup + sleep)
 
 **Files:**
 - Modify: `scraper/worker.py`
 - Test: `tests/test_worker.py`
+
+**Why this shape:** `scrape_item(url)` with no `client` runs a homepage warmup GET **and `time.sleep(1.0)`** per item (`scraper/scraper.py:190-199`), plus the wrong-country guard at line 236 keys off `proxy_url`. We bypass the warmup+sleep by always passing a `client` (a `curl_cffi` session we build per call with `apply_proxy_country`), so the `TokenBucket` is the only rate governor. This is what retires the per-item sleep the spec calls out, while leaving `scrape_item`'s own-client path intact for `proxy test`/standalone use. The session must be a real `curl_cffi` session (Chrome TLS impersonation), not httpx, so it matches the production fetch path.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -505,14 +507,16 @@ from scraper.fetch import ChallengeError
 from scraper.throttle import TokenBucket, BoxProxyState
 
 
-def test_scrape_one_escalates_to_residential_on_challenge(monkeypatch):
+def test_scrape_one_injects_session_and_escalates_on_challenge(monkeypatch):
     import scraper.worker as w
-    calls = []
+    calls = []  # (proxy_url, client_is_not_none)
+
+    monkeypatch.setattr(w, "build_session", lambda proxy=None: f"session::{proxy}")
 
     def fake_scrape_item(item_url, proxy_url=None, client=None):
-        calls.append(proxy_url)
+        calls.append((proxy_url, client))
         if proxy_url is None:
-            raise ChallengeError("blocked")
+            raise ChallengeError("blocked")  # direct attempt is challenged
         return _pd("111111111111")
 
     monkeypatch.setattr(w, "scrape_item", fake_scrape_item)
@@ -525,11 +529,14 @@ def test_scrape_one_escalates_to_residential_on_challenge(monkeypatch):
         box_state=state, bucket=bucket,
     )
     assert result is not None
-    assert calls == [None, "http://user:pass@proxy:8080"]  # tried direct, then residential
+    # tried direct first, then residential; a non-None client was injected both times
+    assert [c[0] for c in calls] == [None, "http://user:pass@proxy:8080"]
+    assert all(c[1] is not None for c in calls)
 
 
 def test_scrape_one_returns_none_on_404(monkeypatch):
     import scraper.worker as w
+    monkeypatch.setattr(w, "build_session", lambda proxy=None: "session")
     monkeypatch.setattr(w, "scrape_item", lambda *a, **k: None)
     bucket = TokenBucket(1000.0)
     state = BoxProxyState(0.15, 10.0)
@@ -538,7 +545,7 @@ def test_scrape_one_returns_none_on_404(monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_worker.py::test_scrape_one_escalates_to_residential_on_challenge -v`
+Run: `pytest tests/test_worker.py::test_scrape_one_injects_session_and_escalates_on_challenge -v`
 Expected: FAIL (`_scrape_one` not defined)
 
 - [ ] **Step 3: Implement `_scrape_one`**
@@ -547,40 +554,45 @@ Add to `scraper/worker.py`:
 
 ```python
 from scraper.scraper import scrape_item
-from scraper.fetch import ChallengeError, WrongCountryError
+from scraper.fetch import ChallengeError, WrongCountryError, build_session, apply_proxy_country
 from scraper.throttle import TokenBucket, BoxProxyState
 
 
 def _scrape_one(item_url, residential_proxy, box_state: BoxProxyState, bucket: TokenBucket):
     """Fetch one item. Box IP first; on challenge or wrong country, retry via residential.
 
-    Raises if the residential retry also fails so the caller can mark it failed.
+    A curl_cffi session is built and injected per attempt, which makes scrape_item
+    skip its homepage warmup and 1s sleep (those only run on its own-client path).
+    The TokenBucket is therefore the only rate governor. Raises if the residential
+    retry also fails so the caller can mark the item failed.
     """
     bucket.acquire()
-    use_residential = box_state.should_use_residential() and residential_proxy
+    use_residential = bool(box_state.should_use_residential() and residential_proxy)
     proxy = residential_proxy if use_residential else None
     try:
-        data = scrape_item(item_url, proxy_url=proxy)
+        session = build_session(apply_proxy_country(proxy, item_url))
+        data = scrape_item(item_url, proxy_url=proxy, client=session)
         box_state.record(challenged=False)
         return data
     except (ChallengeError, WrongCountryError):
         box_state.record(challenged=True)
         if residential_proxy and not use_residential:
             bucket.acquire()
-            return scrape_item(item_url, proxy_url=residential_proxy)
+            session = build_session(apply_proxy_country(residential_proxy, item_url))
+            return scrape_item(item_url, proxy_url=residential_proxy, client=session)
         raise
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `pytest tests/test_worker.py::test_scrape_one_escalates_to_residential_on_challenge tests/test_worker.py::test_scrape_one_returns_none_on_404 -v`
+Run: `pytest tests/test_worker.py::test_scrape_one_injects_session_and_escalates_on_challenge tests/test_worker.py::test_scrape_one_returns_none_on_404 -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add scraper/worker.py tests/test_worker.py
-git commit -m "feat: per-item fetch with box-IP-first, residential-on-challenge escalation"
+git commit -m "feat: per-item fetch injects session (no warmup/sleep) with residential escalation"
 ```
 
 ### Task C2: `scrape_batch` job (concurrent fetch + bulk write + requeue)
@@ -1366,10 +1378,10 @@ Expected: prints `N items found, N new jobs queued`.
 
 Run: `ssh automation-management 'journalctl -u ebay-worker -f --since "2 min ago"'` for ~60s, and separately:
 Run: `watch -n5 'docker exec ebay-scraper-postgres-1 psql -U scraper -d ebayscraper -tc "SELECT count(*) FROM products WHERE niche=\\'e2e\\'"'`
-Expected: row count climbs at **dozens/sec**, far above the old ~2/min. Record the items/sec over a 2-minute window.
+Expected: row count climbs at **several items/sec**, far above the old ~2/min. Record the items/sec over a 2-minute window.
 
 - [ ] **Step 5: Pass criteria**
-  - Throughput >= 10 items/sec on one box at default `WORKER_CONCURRENCY=8`, `MAX_RPS_PER_IP=6` (raise/lower these via the VPS `.env` and `systemctl restart ebay-worker` if challenge rate is high or throughput is low; record the final values).
+  - Throughput >= 2.5 items/sec on one box at default `WORKER_CONCURRENCY=8`, `MAX_RPS_PER_IP=6` (2 requests/item, so ~3 items/s is the ceiling at this cap, ~130x the old rate). Only after Task H3 proves residential escalation absorbs challenges, optionally raise `MAX_RPS_PER_IP`/`WORKER_CONCURRENCY` via the VPS `.env` + `systemctl restart ebay-worker` to push higher; record the final values.
   - Challenge rate low enough that the backfill completes without stalling.
   - Spot-check 5 rows: `scraper export --niche e2e --output /tmp/e2e.csv` then inspect that title, price, currency, description, item_specifics, mpn/upc are populated for items that have them.
 
