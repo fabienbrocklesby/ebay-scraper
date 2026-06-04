@@ -164,17 +164,22 @@ def _crawl_pages(
 ) -> list[str]:
     """Fetch listing pages for `base_url` (already has any filter params) and return item URLs.
 
-    Simplified inner loop used by both the normal crawl path and the partitioned
-    re-crawl path. Does NOT handle challenges or session rotation; callers that need
-    robustness should use get_item_urls_from_store directly.
+    Simplified inner loop used by the partitioned re-crawl path. It does not rotate
+    sessions, but it must not swallow a challenge: reading a challenge page as
+    "no more items" would silently truncate the partition and drop products. So a
+    challenge is raised loudly, letting the caller report the store as blocked.
     """
     seen: dict[str, None] = {}
     page = 1
     while page <= max_pages:
         page_url = _page_url(base_url, page)
         html = _fetch_listing_page(client, page_url, homepage)
-        if html is None or is_challenge_page(html):
+        if html is None:
             break
+        if is_challenge_page(html):
+            raise ChallengeError(
+                f"eBay challenge during partitioned crawl of {base_url}, page {page}"
+            )
         for url in _extract_item_urls(html):
             seen[url] = None
         if not _has_next_page(html):
