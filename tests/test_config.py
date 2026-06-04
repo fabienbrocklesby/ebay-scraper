@@ -37,3 +37,31 @@ def test_requests_per_second_defaults_to_half(monkeypatch):
     monkeypatch.delenv("REQUESTS_PER_SECOND", raising=False)
     s = Settings()
     assert s.requests_per_second == 0.5
+
+
+def test_settings_concurrency_defaults(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.delenv("WORKER_CONCURRENCY", raising=False)
+    monkeypatch.delenv("MAX_RPS_PER_IP", raising=False)
+    monkeypatch.delenv("BATCH_SIZE", raising=False)
+    from scraper.config import Settings
+    s = Settings()
+    assert s.worker_concurrency == 8
+    assert s.max_rps_per_ip == 6.0
+    assert s.batch_size == 200
+    assert s.challenge_escalation_threshold == 0.15
+    assert s.challenge_cooldown_seconds == 120.0
+
+
+def test_settings_concurrency_overrides(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("WORKER_CONCURRENCY", "16")
+    monkeypatch.setenv("MAX_RPS_PER_IP", "10")
+    monkeypatch.setenv("BATCH_SIZE", "100")
+    from scraper.config import Settings
+    s = Settings()
+    assert s.worker_concurrency == 16
+    assert s.max_rps_per_ip == 10.0
+    assert s.batch_size == 100

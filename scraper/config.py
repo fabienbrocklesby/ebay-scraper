@@ -25,6 +25,11 @@ class Settings:
     database_url: str
     proxy_url: str | None
     requests_per_second: float
+    worker_concurrency: int
+    max_rps_per_ip: float
+    batch_size: int
+    challenge_escalation_threshold: float
+    challenge_cooldown_seconds: float
 
     def __init__(self):
         redis_url = os.getenv("REDIS_URL")
@@ -38,3 +43,8 @@ class Settings:
         self.database_url = database_url
         self.proxy_url = proxy_raw if proxy_raw else None
         self.requests_per_second = float(os.getenv("REQUESTS_PER_SECOND", "0.5"))
+        self.worker_concurrency = int(os.getenv("WORKER_CONCURRENCY", "8"))
+        self.max_rps_per_ip = float(os.getenv("MAX_RPS_PER_IP", "6"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "200"))
+        self.challenge_escalation_threshold = float(os.getenv("CHALLENGE_ESCALATION_THRESHOLD", "0.15"))
+        self.challenge_cooldown_seconds = float(os.getenv("CHALLENGE_COOLDOWN_SECONDS", "120"))
