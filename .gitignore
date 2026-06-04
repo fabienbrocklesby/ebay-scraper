@@ -5,3 +5,6 @@ __pycache__/
 # exported data
 *.csv
 build/
+
+# agent worktrees / local state
+.claude/
