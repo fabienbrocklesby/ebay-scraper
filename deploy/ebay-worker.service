@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/root/ebay-scraper/.env
+EnvironmentFile=/root/.config/ebay-scraper/.env
 ExecStart=/usr/local/bin/scraper worker start
 Restart=always
 RestartSec=5
