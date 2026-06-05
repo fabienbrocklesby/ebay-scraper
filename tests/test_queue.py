@@ -70,3 +70,53 @@ def test_mark_item_queued_calls_sadd():
     r = make_mock_redis()
     mark_item_queued(r, "999")
     r.sadd.assert_called_once_with("scraped_items", "999")
+
+
+def test_queue_is_drained_true_when_empty():
+    from unittest.mock import patch, MagicMock
+    from scraper.queue import queue_is_drained
+
+    mock_queue = MagicMock()
+    mock_queue.count = 0
+
+    mock_registry = MagicMock()
+    mock_registry.count = 0
+
+    with patch("scraper.queue.StartedJobRegistry", return_value=mock_registry), \
+         patch("scraper.queue.DeferredJobRegistry", return_value=mock_registry), \
+         patch("scraper.queue.ScheduledJobRegistry", return_value=mock_registry):
+        assert queue_is_drained(mock_queue) is True
+
+
+def test_queue_is_drained_false_when_pending():
+    from unittest.mock import patch, MagicMock
+    from scraper.queue import queue_is_drained
+
+    mock_queue = MagicMock()
+    mock_queue.count = 5
+
+    mock_registry = MagicMock()
+    mock_registry.count = 0
+
+    with patch("scraper.queue.StartedJobRegistry", return_value=mock_registry), \
+         patch("scraper.queue.DeferredJobRegistry", return_value=mock_registry), \
+         patch("scraper.queue.ScheduledJobRegistry", return_value=mock_registry):
+        assert queue_is_drained(mock_queue) is False
+
+
+def test_queue_is_drained_false_when_running():
+    from unittest.mock import patch, MagicMock
+    from scraper.queue import queue_is_drained
+
+    mock_queue = MagicMock()
+    mock_queue.count = 0
+
+    started_registry = MagicMock()
+    started_registry.count = 2
+    empty_registry = MagicMock()
+    empty_registry.count = 0
+
+    with patch("scraper.queue.StartedJobRegistry", return_value=started_registry), \
+         patch("scraper.queue.DeferredJobRegistry", return_value=empty_registry), \
+         patch("scraper.queue.ScheduledJobRegistry", return_value=empty_registry):
+        assert queue_is_drained(mock_queue) is False

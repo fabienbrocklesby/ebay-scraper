@@ -1,6 +1,7 @@
 import re
 import redis as redis_lib
 from rq import Queue, Retry
+from rq.registry import StartedJobRegistry, DeferredJobRegistry, ScheduledJobRegistry
 
 SCRAPED_SET_KEY = "scraped_items"
 PROXY_REDIS_KEY = "ebay-scraper:proxy_url"
@@ -68,6 +69,19 @@ def enqueue_items(
         queue.enqueue(scrape_batch, batch, niche, store_url, 0, job_timeout=600, retry=_JOB_RETRY)
         enqueued += len(batch)
     return enqueued
+
+
+def queue_is_drained(queue: Queue) -> bool:
+    """True when no jobs are pending, running, deferred (awaiting retry), or scheduled."""
+    started = StartedJobRegistry(queue=queue)
+    deferred = DeferredJobRegistry(queue=queue)
+    scheduled = ScheduledJobRegistry(queue=queue)
+    return (
+        queue.count == 0
+        and started.count == 0
+        and deferred.count == 0
+        and scheduled.count == 0
+    )
 
 
 def enqueue_crawl_job(queue: Queue, store_url: str, niche: str) -> None:
