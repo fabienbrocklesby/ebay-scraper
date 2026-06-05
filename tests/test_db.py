@@ -90,6 +90,16 @@ async def test_store_item_prices_and_deactivate(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_add_store_defaults_niche_to_empty(db_pool):
+    from scraper.db import add_store, list_stores
+    await db_pool.execute("DELETE FROM stores")
+    await add_store(db_pool, "https://www.ebay.com/str/noniche")
+    stores = await list_stores(db_pool)
+    row = next(s for s in stores if s["store_url"] == "https://www.ebay.com/str/noniche")
+    assert row["niche"] == ""
+
+
+@pytest.mark.asyncio
 async def test_products_table_has_delta_columns(db_pool):
     rows = await db_pool.fetch(
         "SELECT column_name FROM information_schema.columns WHERE table_name='products'"

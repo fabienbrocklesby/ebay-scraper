@@ -58,7 +58,7 @@ async def init_schema(pool: asyncpg.Pool) -> None:
     await pool.execute("""
         CREATE TABLE IF NOT EXISTS stores (
             store_url TEXT PRIMARY KEY,
-            niche     TEXT NOT NULL,
+            niche     TEXT NOT NULL DEFAULT '',
             added_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
@@ -109,7 +109,7 @@ async def clear_niche(pool: asyncpg.Pool, niche: str) -> None:
     await pool.execute("DELETE FROM products WHERE niche = $1", niche)
 
 
-async def add_store(pool: asyncpg.Pool, store_url: str, niche: str) -> None:
+async def add_store(pool: asyncpg.Pool, store_url: str, niche: str = "") -> None:
     await pool.execute(
         """
         INSERT INTO stores (store_url, niche)
