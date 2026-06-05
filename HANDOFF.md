@@ -64,6 +64,36 @@ Placeholders used below (fill in your own values):
 
 ---
 
+## 2b. Shopping list: what to buy and where
+
+**Coordinator:** your own PC. Costs nothing. Keep it on while scraping.
+
+**Worker VPSs** (rent as many as you want, more = faster). Any cheap Linux VPS:
+- **Hetzner Cloud** (cheapest, recommended): <https://www.hetzner.com/cloud> — a CPX11
+  (2 vCPU, 2 GB) is about EUR 4-5/month, or pennies/hour billed hourly. Ubuntu 22.04.
+- **Vultr** (<https://www.vultr.com>) or **DigitalOcean** (<https://www.digitalocean.com>):
+  ~$6/month equivalents, hourly billing. Pick the cheapest 1-2 vCPU Ubuntu instance.
+- One VPS does ~2 items/sec (~190k items/day). Rent N of them for N times the speed;
+  they share the queue automatically. For a big one-off run, rent several by the hour
+  and delete them when done.
+
+**Proxy** (the workers fetch through this). One account, billed by bandwidth (per GB):
+- **IPRoyal Residential** (<https://iproyal.com>, what this was built and tested on):
+  ~$2-7/GB. Endpoint `geo.iproyal.com:12321`. Pay-as-you-go, buy a bulk GB package for
+  big runs. Budget ~1 GB per ~7,000 items.
+- **Decodo / Smartproxy** (<https://decodo.com>): cheaper (~$2.2/GB), works about the
+  same. Use country subdomains, e.g. `us.decodo.com:10001`. A drop-in alternative.
+- **Honest note (read section 10):** any rotating residential proxy reliably gets ~80%
+  of stores. A stubborn ~15-20% serve a fake "0 results" page to *all* residential
+  proxies; those are recovered by the coordinator's own IP + `scraper scrape retry`,
+  or, for hands-off near-100%, by an **unblocker API** (Bright Data Web Unlocker
+  ~$1.30/1,000 requests, or Oxylabs eBay Scraper API). Start with a plain residential
+  proxy; only add an unblocker if the re-run list stays too big.
+
+**Tailscale:** free (<https://tailscale.com>), connects the coordinator and VPSs privately.
+
+---
+
 ## 3. Coordinator setup (your PC, one time)
 
 Tested end to end on **macOS and Linux**. Windows should work with Docker Desktop,
@@ -159,10 +189,17 @@ sellers' store name differs from their username).
 ```bash
 scraper scrape start                   # crawl every registered store, queue all items
 scraper scrape start --niche tools     # or just one niche
+scraper scrape retry                   # re-run only the stores that returned 0 last time
 scraper scrape status                  # progress: queued jobs + totals
 scraper export --output products.csv   # write the CSV (everything)
 scraper export --niche tools --output tools.csv
 ```
+
+`scrape start` reports every store as **OK (N items)**, **0 results**, or **BLOCKED**,
+and saves anything that returned nothing to `~/.config/ebay-scraper/failed_stores.txt`.
+A "0 results" store is usually a flagged-IP fake-empty, not a truly empty store (see
+section 10). Just run **`scraper scrape retry`** a bit later (fresh IPs recover most of
+them); repeat until the list is small. This is normal at scale, not a failure.
 
 ### Keep it fresh cheaply (after the first full scrape)
 
@@ -256,6 +293,18 @@ scraper init <COORDINATOR_IP> --proxy "<PROXY_URL>"     # rebuilds + restarts th
 
 ## 10. Honest limits (so there are no surprises)
 
+- **About 15-20% of stores serve a fake "0 results" page to residential proxies.**
+  eBay detects proxy IPs and, for some stores, serves an empty storefront instead of
+  the real item grid, to every proxy IP, on every provider (tested IPRoyal and Decodo,
+  same result). It is not an empty store and not a bug. Those stores are recovered by:
+  (a) the **coordinator's own home/office IP**, which the scraper automatically falls
+  back to and which eBay serves the real grid; and (b) **`scraper scrape retry`**, which
+  re-runs the leftovers later on fresh IPs. The catch: a single IP gets throttled after
+  a few thousand fast requests, so for 1,000+ stores this is **iterative**, scrape, run
+  `scrape retry` a few times over the next day, and the list shrinks each pass. For
+  near-100% hands-off (no re-runs), use an **unblocker API** (Bright Data Web Unlocker
+  or Oxylabs eBay Scraper API), which defeats the anti-bot per request, that is the
+  paid upgrade if the manual re-run loop is too much.
 - **Cost scales with proxy bandwidth on VPS workers.** Millions of items is doable
   but the proxy bill is real (section 7). The cheap-but-fiddly alternative is to run
   workers on residential-IP machines (no proxy needed), but eBay challenges a single

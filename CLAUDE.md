@@ -20,6 +20,22 @@ Key hard-won behaviour to preserve:
 - **A cold session gets 403 even from a residential IP.** `scrape_item`'s own-client path warms via a homepage GET; the batched worker injects a **warmed, reused** per-thread session (`_warmed_session`) to skip the per-item warmup+sleep while still carrying cookies. Do not "optimize" the warmup away.
 - On macOS, rq's per-job fork aborts under Objective-C fork-safety; `start_worker` sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` on darwin. Production workers run on Linux (Docker) and are unaffected.
 
+## Current status and open decisions (as of 2026-06-05)
+
+**Shipped and validated on real infra** (Mac coordinator + `automation-management` VPS + IPRoyal proxy + live stores), 88 tests passing, pushed to **github.com/fabienbrocklesby/ebay-scraper** (private). `HANDOFF.md` at the repo root is the complete Kieran-facing setup + buying guide. The full session history is in Context OS (project `dropship-side`).
+
+What works end to end: from-scratch VPS install from GitHub (`git clone` -> `pip install -e .` -> `scraper init <coord-ip>`); coordinator (`coordinator start` / `connect` / `db init` / `proxy set`/`test`); `store add` + `store import <file>`; batched concurrent detail scraping via proxy (full gallery images + description + all fields); `scrape delta`; CSV export. Throughput ~2.2 items/sec/VPS via proxy, scale by adding VPSs.
+
+**The hard problem (open):** eBay serves a fake "0 results" storefront to residential proxy IPs for ~15-20% of stores, on **every** provider (tested IPRoyal and Decodo, same ~80% success; switching residential pools does NOT fix it). Mitigations built: discovery is proxy-first then falls back to the coordinator's genuine IP (which eBay serves the real grid), every store is reported OK/0-results/blocked, failures saved to `~/.config/ebay-scraper/failed_stores.txt`, and `scraper scrape retry` re-runs them. At 1000+ stores this is iterative (one IP throttles after ~3,500 fast requests).
+
+**Decisions pending for Fabien/Kieran:**
+1. **Unblocker API?** For near-100% hands-off on the hard stores, an unblocker (Bright Data Web Unlocker ~$1.30/1k requests, or Oxylabs eBay Scraper API which has a free 2k-request trial) is the real lever. NOT YET TESTED, the next concrete step is to grab the Oxylabs free trial and confirm it gets `goodpricepeople` (a known hard store) before committing.
+2. **Total catalogue size** across Kieran's ~1500 stores is still unpinned; it sizes proxy-bandwidth cost (~135 KB/item on the wire, ~1 GB per 7,000 items).
+3. **Repo public vs private** (private now; public removes the GitHub-token step for Kieran).
+4. Proxy: keep IPRoyal (Decodo is an equal-reliability, cheaper alternative; neither fixes the hard 20%).
+
+**Live infra state:** Mac coordinator services up (Redis 6379, Postgres 5432); VPS worker running latest image; IPRoyal proxy set in Redis (`ebay-scraper:proxy_url`). The Mac's own IP is currently rate-flagged by eBay from heavy testing (will cool down).
+
 ## Implementation Plan
 
 `docs/superpowers/plans/2026-06-03-ebay-scraper.md`
