@@ -25,8 +25,10 @@ CANDIDATE_MARKETPLACES: list[tuple[str, str]] = [
     ("www.ebay.co.uk", "gb"),
 ]
 
-# Detection only needs an item-count signal, so request a small page to limit bandwidth.
-_DETECT_ITEMS_PER_PAGE = 60
+# Detection picks the domain with the most items, so the page size must be large enough
+# that a true home (hundreds of items) outscores a thin cross-listing; 60 caps every
+# successful probe at 60 and destroys that signal.
+_DETECT_ITEMS_PER_PAGE = 240
 _MAX_PROBE_RETRIES = 3
 
 FetchFn = Callable[[str, Optional[str]], str]

@@ -42,38 +42,93 @@ def test_parse_store_lines_requires_a_niche():
         _parse_store_lines("https://www.ebay.com.au/str/x", default_niche=None)
 
 
-def test_resolve_marketplace_url_uses_cached_domain():
-    from scraper.cli import _resolve_marketplace_url
-    url = _resolve_marketplace_url(
-        store_url="https://www.ebay.com/str/aussie",
-        cached=("www.ebay.com.au", "au"),
-        detect=lambda seller_id, proxy_url: (_ for _ in ()).throw(AssertionError("should not detect")),
-        proxy_url=None,
-    )
-    assert url == "https://www.ebay.com.au/sch/i.html?_ssn=aussie"
-
-
-def test_resolve_marketplace_url_detects_when_uncached():
-    from scraper.cli import _resolve_marketplace_url
+def test_detect_and_resolve_adopts_confident_proxy_result(monkeypatch):
+    import scraper.cli as c
     from scraper.marketplace import DetectionOutcome, MarketplaceResult
     captured = {}
 
-    def fake_detect(seller_id, proxy_url):
-        return DetectionOutcome(
-            result=MarketplaceResult("www.ebay.com.au", "au", 200,
-                                     "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=60"),
-            undetermined_domains=[],
-        )
+    monkeypatch.setattr(c, "detect_marketplace", lambda seller_id, proxy_url, **kw: DetectionOutcome(
+        result=MarketplaceResult("www.ebay.com.au", "au", 240,
+                                 "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
+        undetermined_domains=[],
+    ))
 
-    url = _resolve_marketplace_url(
-        store_url="https://www.ebay.com/str/aussie",
-        cached=None,
-        detect=fake_detect,
-        proxy_url=None,
+    url = c._detect_and_resolve(
+        seller_id="aussie",
+        proxy_url="http://proxy",
         on_detected=lambda domain, country: captured.update(domain=domain, country=country),
+        unblocker_config=None,
+        redis_conn=None,
     )
     assert url == "https://www.ebay.com.au/sch/i.html?_ssn=aussie"
     assert captured == {"domain": "www.ebay.com.au", "country": "au"}
+
+
+def test_detect_and_resolve_does_not_adopt_when_undetermined_and_unblocker_off(monkeypatch):
+    import scraper.cli as c
+    from scraper.marketplace import DetectionOutcome, MarketplaceResult
+    from scraper.unblocker import UnblockerConfig
+    called = {"on_detected": False}
+
+    monkeypatch.setattr(c, "detect_marketplace", lambda seller_id, proxy_url, **kw: DetectionOutcome(
+        result=MarketplaceResult("www.ebay.com.au", "au", 186,
+                                 "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
+        undetermined_domains=["www.ebay.com"],
+    ))
+
+    url = c._detect_and_resolve(
+        seller_id="aussie",
+        proxy_url="http://proxy",
+        on_detected=lambda domain, country: called.update(on_detected=True),
+        unblocker_config=UnblockerConfig("none", None, None),
+        redis_conn=None,
+    )
+    assert url is None
+    assert called["on_detected"] is False
+
+
+def test_detect_and_resolve_escalates_to_unblocker_when_undetermined(monkeypatch):
+    import scraper.cli as c
+    from scraper.marketplace import DetectionOutcome, MarketplaceResult
+    from scraper.unblocker import UnblockerConfig
+    captured = {}
+
+    def fake_detect(seller_id, proxy_url, **kwargs):
+        if "fetch_fn" in kwargs:  # authoritative unblocker probe
+            return DetectionOutcome(
+                result=MarketplaceResult("www.ebay.com", "us", 312,
+                                         "https://www.ebay.com/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
+                undetermined_domains=[],
+            )
+        return DetectionOutcome(  # proxy probe: home left undetermined
+            result=MarketplaceResult("www.ebay.com.au", "au", 186,
+                                     "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
+            undetermined_domains=["www.ebay.com"],
+        )
+
+    monkeypatch.setattr(c, "detect_marketplace", fake_detect)
+    monkeypatch.setattr(c, "fetch_via_unblocker", lambda url, cfg, conn: "<html/>")
+
+    url = c._detect_and_resolve(
+        seller_id="aussie",
+        proxy_url="http://proxy",
+        on_detected=lambda domain, country: captured.update(domain=domain, country=country),
+        unblocker_config=UnblockerConfig("oxylabs", "user", "pass"),
+        redis_conn=None,
+    )
+    assert url == "https://www.ebay.com/sch/i.html?_ssn=aussie"
+    assert captured == {"domain": "www.ebay.com", "country": "us"}
+
+
+def test_discover_store_cached_skips_detection(monkeypatch):
+    import scraper.cli as c
+    monkeypatch.setattr(c, "detect_marketplace",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not detect")))
+    monkeypatch.setattr(c, "get_item_urls_from_store",
+                        lambda url, proxy_url=None, requests_per_second=0.5: [])
+    assert c._discover_store(
+        "https://www.ebay.com/str/aussie", "http://proxy", 0.5, cached=("www.ebay.com.au", "au")
+    ) == ("empty", [])
 
 
 def test_discover_store_empty_trusts_clean_zero(monkeypatch):

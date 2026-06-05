@@ -20,13 +20,11 @@ from scraper.db import (
 )
 from scraper.export import export_to_csv, export_split_csv
 from scraper.fetch import ChallengeError
-from scraper.marketplace import (
-    CANDIDATE_MARKETPLACES, DetectionOutcome, detect_marketplace,
-)
+from scraper.marketplace import detect_marketplace
 from scraper.queue import enqueue_items, get_queue, get_redis, queue_is_drained, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
 from scraper.store import (
-    _normalize_store_url, _extract_item_urls, extract_seller_id, get_item_urls_from_store,
+    _normalize_store_url, extract_seller_id, get_item_urls_from_store,
 )
 from scraper.unblocker import fetch_via_unblocker, load_unblocker_config, UNBLOCKER_COUNT_KEY
 from scraper.worker import start_worker
@@ -558,24 +556,32 @@ def _marketplace_seller_search(domain: str, seller_id: str) -> str:
     return f"https://{domain}/sch/i.html?_ssn={seller_id}"
 
 
-def _resolve_marketplace_url(
-    store_url: str,
-    cached: tuple[str, str] | None,
-    detect: Callable[[str, str | None], "DetectionOutcome"],
-    proxy_url: str | None,
-    on_detected: Callable[[str, str], None] | None = None,
-) -> str | None:
-    """Return the seller-search URL on the store's home marketplace, or None if the
-    store could not be resolved. detect(seller_id, proxy_url) -> DetectionOutcome.
-    on_detected(domain, country) persists a freshly detected marketplace."""
-    seller_id = extract_seller_id(store_url)
-    if cached is not None:
-        return _marketplace_seller_search(cached[0], seller_id)
-    outcome = detect(seller_id, proxy_url)
-    if outcome.result is not None:
+def _detect_and_resolve(seller_id, proxy_url, on_detected, unblocker_config, redis_conn):
+    """Resolve a seller's home-marketplace seller-search URL, honestly.
+
+    Trust a proxy detection only when every candidate answered conclusively (a result
+    AND no undetermined/challenged domains). Otherwise we cannot tell the seller's true
+    home from a cross-listing, so never silently adopt the proxy result: escalate to an
+    authoritative unblocker detection if configured, else return None (store stays
+    unresolved and is reported loudly rather than scraped in the wrong currency).
+    """
+    outcome = detect_marketplace(seller_id, proxy_url)
+    if outcome.result is not None and not outcome.undetermined_domains:
         if on_detected is not None:
             on_detected(outcome.result.domain, outcome.result.country)
         return _marketplace_seller_search(outcome.result.domain, seller_id)
+
+    if unblocker_config is not None and unblocker_config.enabled:
+        def _ufetch(url, _proxy):
+            html = fetch_via_unblocker(url, unblocker_config, redis_conn)
+            if not html:
+                raise ChallengeError("unblocker returned no content")
+            return html
+        uoutcome = detect_marketplace(seller_id, None, fetch_fn=_ufetch)
+        if uoutcome.result is not None:
+            if on_detected is not None:
+                on_detected(uoutcome.result.domain, uoutcome.result.country)
+            return _marketplace_seller_search(uoutcome.result.domain, seller_id)
     return None
 
 
@@ -591,23 +597,18 @@ def _discover_store(
     """Resolve a store's home marketplace, then crawl item URLs from that domain.
 
     eBay serves each seller's listings on their home marketplace (.com, .com.au,
-    .co.uk, ...). Detection probes the candidate domains so the crawl hits the one
-    that actually holds the grid; a cached marketplace skips that probe. When the
-    store cannot be resolved (every probe was a degraded "0 results" view) and an
-    unblocker is configured, we probe the candidate domains through the unblocker
-    and adopt the first that yields items. Returns (outcome, urls) with outcome in
-    "ok", "empty", or "blocked": a crawl ChallengeError is "blocked", a clean crawl
-    with no items is "empty".
+    .co.uk, ...). A cached marketplace skips detection; otherwise detection is
+    confidence-gated (see _detect_and_resolve): a proxy result is adopted only when no
+    candidate was left undetermined, else we escalate to an unblocker or leave the
+    store unresolved rather than scrape a cross-listing in the wrong currency. Returns
+    (outcome, urls) with outcome in "ok", "empty", or "blocked": a crawl ChallengeError
+    is "blocked", a clean crawl with no items is "empty".
     """
-    resolved = _resolve_marketplace_url(store_url, cached, detect_marketplace, proxy_url, on_detected)
-    if resolved is None and unblocker_config is not None and unblocker_config.enabled:
-        seller_id = extract_seller_id(store_url)
-        for domain, _country in CANDIDATE_MARKETPLACES:
-            html = fetch_via_unblocker(_marketplace_seller_search(domain, seller_id),
-                                       unblocker_config, redis_conn)
-            if html and _extract_item_urls(html):
-                resolved = _marketplace_seller_search(domain, seller_id)
-                break
+    seller_id = extract_seller_id(store_url)
+    if cached is not None:
+        resolved = _marketplace_seller_search(cached[0], seller_id)
+    else:
+        resolved = _detect_and_resolve(seller_id, proxy_url, on_detected, unblocker_config, redis_conn)
     if resolved is None:
         return ("empty", [])
     try:
