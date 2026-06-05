@@ -8,3 +8,4 @@ build/
 
 # agent worktrees / local state
 .claude/
+CLAUDE.md

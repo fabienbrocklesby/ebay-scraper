@@ -246,7 +246,7 @@ scraper scrape retry
 
 ---
 
-## 8. Honest limits (no surprises)
+## 8. Limits (no surprises)
 
 - **It tells the truth.** If it can't confidently read a shop, it marks it `unresolved`
   and saves it for retry rather than guessing and giving you wrong-country prices.
