@@ -1,5 +1,5 @@
-from unittest.mock import MagicMock
-from scraper.queue import enqueue_items, is_item_queued, mark_item_queued
+from unittest.mock import MagicMock, patch
+from scraper.queue import enqueue_items, is_item_queued, mark_item_queued, queue_is_drained
 
 
 def make_mock_redis(already_queued: set = None):
@@ -73,9 +73,6 @@ def test_mark_item_queued_calls_sadd():
 
 
 def test_queue_is_drained_true_when_empty():
-    from unittest.mock import patch, MagicMock
-    from scraper.queue import queue_is_drained
-
     mock_queue = MagicMock()
     mock_queue.count = 0
 
@@ -89,9 +86,6 @@ def test_queue_is_drained_true_when_empty():
 
 
 def test_queue_is_drained_false_when_pending():
-    from unittest.mock import patch, MagicMock
-    from scraper.queue import queue_is_drained
-
     mock_queue = MagicMock()
     mock_queue.count = 5
 
@@ -105,9 +99,6 @@ def test_queue_is_drained_false_when_pending():
 
 
 def test_queue_is_drained_false_when_running():
-    from unittest.mock import patch, MagicMock
-    from scraper.queue import queue_is_drained
-
     mock_queue = MagicMock()
     mock_queue.count = 0
 
@@ -119,4 +110,38 @@ def test_queue_is_drained_false_when_running():
     with patch("scraper.queue.StartedJobRegistry", return_value=started_registry), \
          patch("scraper.queue.DeferredJobRegistry", return_value=empty_registry), \
          patch("scraper.queue.ScheduledJobRegistry", return_value=empty_registry):
+        assert queue_is_drained(mock_queue) is False
+
+
+def test_queue_is_drained_false_when_deferred():
+    mock_queue = MagicMock()
+    mock_queue.count = 0
+
+    started_registry = MagicMock()
+    started_registry.count = 0
+    deferred_registry = MagicMock()
+    deferred_registry.count = 3
+    scheduled_registry = MagicMock()
+    scheduled_registry.count = 0
+
+    with patch("scraper.queue.StartedJobRegistry", return_value=started_registry), \
+         patch("scraper.queue.DeferredJobRegistry", return_value=deferred_registry), \
+         patch("scraper.queue.ScheduledJobRegistry", return_value=scheduled_registry):
+        assert queue_is_drained(mock_queue) is False
+
+
+def test_queue_is_drained_false_when_scheduled():
+    mock_queue = MagicMock()
+    mock_queue.count = 0
+
+    started_registry = MagicMock()
+    started_registry.count = 0
+    deferred_registry = MagicMock()
+    deferred_registry.count = 0
+    scheduled_registry = MagicMock()
+    scheduled_registry.count = 4
+
+    with patch("scraper.queue.StartedJobRegistry", return_value=started_registry), \
+         patch("scraper.queue.DeferredJobRegistry", return_value=deferred_registry), \
+         patch("scraper.queue.ScheduledJobRegistry", return_value=scheduled_registry):
         assert queue_is_drained(mock_queue) is False
