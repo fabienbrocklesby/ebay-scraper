@@ -1085,6 +1085,71 @@ def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> 
 
 
 # ---------------------------------------------------------------------------
+# setup wizard
+# ---------------------------------------------------------------------------
+
+
+def _probe_proxy_ok(proxy_url: str) -> bool:
+    """Fetch a real eBay store page through the proxy; return True only if no challenge page.
+
+    The broad except is intentional: any failure (network, timeout, DNS, etc.) means
+    the proxy is not usable for scraping, and the wizard must report red rather than crash.
+    """
+    from scraper.fetch import apply_proxy_country, build_session, is_challenge_page
+    target = "https://www.ebay.com/sch/i.html?_ssn=onlinesound&_pgn=1&_ipg=60"
+    try:
+        session = build_session(apply_proxy_country(proxy_url, target))
+        session.get("https://www.ebay.com/", timeout=30)
+        resp = session.get(target, timeout=40)
+        return not is_challenge_page(resp.text)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _probe_unblocker_ok(username: str, password: str) -> bool:
+    """Fetch a real eBay page via the Oxylabs unblocker; return True if HTML is returned."""
+    from scraper.unblocker import UnblockerConfig, fetch_via_unblocker
+    cfg = UnblockerConfig(provider="oxylabs", username=username, password=password)
+    html = fetch_via_unblocker(
+        "https://www.ebay.com/sch/i.html?_ssn=onlinesound&_pgn=1&_ipg=60", cfg
+    )
+    return bool(html)
+
+
+@cli.command()
+def setup() -> None:
+    """Interactive setup: paste proxy and optional unblocker credentials."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+
+    proxy_url = click.prompt("Residential proxy URL (http://user:pass@host:port)")
+    click.echo("  testing proxy against eBay ...")
+    if _probe_proxy_ok(proxy_url):
+        redis_conn.set(PROXY_REDIS_KEY, proxy_url)
+        click.echo("  proxy OK and saved.")
+    else:
+        click.echo("  proxy FAILED (challenge or error). Not saved. Re-run setup.")
+        return
+
+    if click.confirm("Add an optional Oxylabs unblocker fallback?", default=False):
+        user = click.prompt("Oxylabs username")
+        pw = click.prompt("Oxylabs password", hide_input=True)
+        click.echo("  testing unblocker ...")
+        if _probe_unblocker_ok(user, pw):
+            from scraper.unblocker import (
+                UNBLOCKER_PROVIDER_KEY, OXYLABS_USER_KEY, OXYLABS_PASS_KEY,
+            )
+            redis_conn.set(UNBLOCKER_PROVIDER_KEY, "oxylabs")
+            redis_conn.set(OXYLABS_USER_KEY, user)
+            redis_conn.set(OXYLABS_PASS_KEY, pw)
+            click.echo("  unblocker OK and saved.")
+        else:
+            click.echo("  unblocker test FAILED. Skipped (proxy-only is fine).")
+
+    click.echo("Setup complete. Run `scraper doctor` to confirm everything is green.")
+
+
+# ---------------------------------------------------------------------------
 # db
 # ---------------------------------------------------------------------------
 
