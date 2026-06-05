@@ -1,342 +1,260 @@
-# eBay Scraper, Setup and Operating Guide
+# eBay Scraper, Kieran's Setup Guide
 
-This is the complete, tested guide to running the scraper. Every command here was
-run end to end against live eBay on 2026-06-04 (coordinator on a Mac, worker on a
-real VPS, through a residential proxy, on real stores). Follow it top to bottom.
+This takes you from nothing to a folder full of product spreadsheets (CSV files) ready
+for Shopify. Follow it top to bottom. You do not need to understand the tech; just copy
+the commands into each server exactly as written and fill in your own details where it
+says so.
 
-Repo: **https://github.com/fabienbrocklesby/ebay-scraper** (private)
+Repo: **https://github.com/fabienbrocklesby/ebay-scraper** (public, so every `git clone`
+below just works, no login or token needed).
 
 ---
 
-## 1. How it works (read this first, it is short)
+## 1. How it works (the simple version)
 
-- You run **one coordinator** (your own PC). It holds the job queue (Redis) and
-  the results database (Postgres), and it is where you type commands (add stores,
-  start a scrape, export the CSV).
-- You run **as many worker VPSs as you want**. Each worker pulls jobs from the
-  coordinator's queue and does the actual page scraping. They all share one queue,
-  so **adding a worker just makes it faster**, with zero extra configuration. Work
-  is split across workers automatically; no two workers do the same item.
-- Workers reach the coordinator over **Tailscale** (a free private network), so you
-  never expose your PC's database to the internet.
-- eBay blocks data-centre/VPS IPs, so workers fetch through a **rotating
-  residential proxy** (IPRoyal). The proxy is set once on the coordinator and every
-  worker uses it automatically.
+Think of it as a tiny factory you rent by the hour:
+
+- **The Coordinator** is the manager. It keeps the list of shops to visit, the to-do
+  list, and the filing cabinet of results. You type your commands here. It is one small
+  server.
+- **The Workers** are the staff. Each one grabs jobs off the to-do list and downloads
+  product pages. Hire more staff and the job finishes faster. They all share one to-do
+  list, so no two ever do the same job. Each worker is its own small server.
+- **IPRoyal** is a wardrobe of disguises. eBay blocks robots, so every page is fetched
+  wearing a "normal person at home" disguise, from the right country.
+- **Oxylabs** is a master key. A handful of pages the disguises can't open, the master
+  key opens. The tool uses it sparingly (mainly just to work out which country a shop
+  belongs to), so it stays cheap.
+- **Tailscale** is a private hallway that connects the manager and the staff so no
+  stranger can wander in.
+
+You drop a text file of shop links, type one command, and a while later you get
+spreadsheet files full of every product. **The tool works out which country each shop is
+in (US, UK, Australia) on its own**, you never tag anything.
 
 ```
-   YOUR PC (coordinator)                 VPS workers (add as many as you want)
-   - Redis (job queue)      <--- Tailscale --->   worker 1  ─┐
-   - Postgres (results)                            worker 2  ─┼─ all pull from the
-   - you type commands                             worker N  ─┘   one shared queue
-        |                                                |
-        |  you: store add / scrape start / export        |  each: scrape pages
-        v                                                v   via the residential proxy
-   products.csv  <-------------------------------  written to Postgres
+   COORDINATOR (the manager)                 WORKERS (the staff, add as many as you like)
+   - keeps the to-do list      <- private ->   worker 1  ─┐
+   - keeps the results              hallway     worker 2  ─┼─ all share one to-do list
+   - you type commands here       (Tailscale)   worker N  ─┘
+        |                                            |
+        |  you: scraper run stores.txt               |  each: downloads product pages
+        v                                            v   wearing an IPRoyal disguise
+   CSV spreadsheets  <------------------------  saved to the filing cabinet
 ```
 
-**The data you get per item:** `item_id, title, price, currency, condition,
-description, image_urls (full gallery, full resolution), item_url, seller_id,
-store_url, category, item_specifics, mpn, upc, shipping, listing_type, niche,
-scraped_at`. Exactly what you need to import into Shopify.
+---
 
-> **Heads up: the CSV is multi-currency.** Because stores span US/AU/UK, the `currency` column contains a mix of USD, AUD, and GBP. The prices are correct for each item's own marketplace. Do NOT map `price` straight into a single-currency Shopify store without first segmenting or converting by the `currency` column, or AUD/GBP prices will import as if they were USD.
+## 2. What to sign up for (about 15 minutes)
+
+1. **Servers (VPSs).** Rent cheap Linux servers. You need **one Coordinator** plus **one
+   or more Workers** (more workers = faster). Recommended: **Hetzner Cloud**
+   (<https://www.hetzner.com/cloud>), a "CPX11" (about EUR 4-5/month, or pennies per hour)
+   running **Ubuntu 22.04**. Vultr or DigitalOcean work too. For a big one-off run, rent
+   several workers by the hour and delete them when done.
+
+2. **IPRoyal residential proxy** (<https://iproyal.com> > Residential). After you buy
+   some traffic, your proxy link looks like:
+   `http://USERNAME:PASSWORD@geo.iproyal.com:12321`. Keep credit on it; if it runs dry,
+   scraping just stops. Budget roughly **1 GB per ~7,000 products**.
+
+3. **Oxylabs** (<https://oxylabs.io> > Web Scraper API / E-Commerce Scraper API). You get
+   a username and password. This is the "master key" that makes sure shops from every
+   country get found. It is used lightly, so it costs very little (see cost section).
+
+4. **Tailscale** (<https://tailscale.com>, free). One account. You will install it on the
+   Coordinator and on every Worker, all signed into this same account.
+
+You will paste two things during setup, so keep them handy:
+- Your **IPRoyal proxy link**: `http://USERNAME:PASSWORD@geo.iproyal.com:12321`
+- Your **Oxylabs username and password**.
 
 ---
 
-## 2. Before you start: three things you need
+## 3. Set up the Coordinator (do this once)
 
-1. A **GitHub access** to the private repo. Two options:
-   - **Easiest:** make the repo public (GitHub > repo > Settings > General >
-     Change visibility). Then every `git clone` below works with no token.
-   - **Keep it private:** create a read-only token at
-     <https://github.com/settings/tokens> (fine-grained, read-only, this repo only),
-     and in the `git clone` commands replace the URL with:
-     `https://x-access-token:YOUR_TOKEN@github.com/fabienbrocklesby/ebay-scraper.git`
-2. A **Tailscale account** (free): <https://tailscale.com>. Install it on the
-   coordinator and on each VPS, all signed into the same account.
-3. An **IPRoyal residential proxy** with **bandwidth/credit on it**:
-   <https://iproyal.com> > Residential. Your proxy URL looks like
-   `http://USERNAME:PASSWORD@geo.iproyal.com:12321`. Budget ~1 GB per ~7,000 items
-   (see section 7). **If the proxy runs out of credit, scraping silently fails with
-   a "402" error, keep credit on it.**
-
-Placeholders used below (fill in your own values):
-- `<COORDINATOR_IP>`  = your PC's Tailscale IP (a `100.x.y.z` address)
-- `<PROXY_URL>`       = `http://USERNAME:PASSWORD@geo.iproyal.com:12321`
-
----
-
-## 2b. Shopping list: what to buy and where
-
-**Coordinator:** your own PC. Costs nothing. Keep it on while scraping.
-
-**Worker VPSs** (rent as many as you want, more = faster). Any cheap Linux VPS:
-- **Hetzner Cloud** (cheapest, recommended): <https://www.hetzner.com/cloud> — a CPX11
-  (2 vCPU, 2 GB) is about EUR 4-5/month, or pennies/hour billed hourly. Ubuntu 22.04.
-- **Vultr** (<https://www.vultr.com>) or **DigitalOcean** (<https://www.digitalocean.com>):
-  ~$6/month equivalents, hourly billing. Pick the cheapest 1-2 vCPU Ubuntu instance.
-- One VPS does ~2 items/sec (~190k items/day). Rent N of them for N times the speed;
-  they share the queue automatically. For a big one-off run, rent several by the hour
-  and delete them when done.
-
-**Proxy** (the workers fetch through this). One account, billed by bandwidth (per GB):
-- **IPRoyal Residential** (<https://iproyal.com>, what this was built and tested on):
-  ~$2-7/GB. Endpoint `geo.iproyal.com:12321`. Pay-as-you-go, buy a bulk GB package for
-  big runs. Budget ~1 GB per ~7,000 items.
-- **Decodo / Smartproxy** (<https://decodo.com>): cheaper (~$2.2/GB), works about the
-  same. Use country subdomains, e.g. `us.decodo.com:10001`. A drop-in alternative.
-- **Honest note (read section 10):** stores span US/AU/UK marketplaces, and the scraper
-  auto-detects each store's home marketplace. This needs a residential proxy that can read
-  each country's eBay cleanly. A healthy proxy does this for free. If your proxy's IPs for
-  a country are reputation-flagged, you have two options: use a **fresh proxy account/pool**
-  (cheapest, try this first), or configure the optional **unblocker** (Oxylabs eBay Scraper
-  API, ~$1.30/1,000 requests) in `scraper setup`, which the scraper uses only for the cheap
-  one-time routing decision (~$6 across ~1,500 stores) while bulk scraping stays on the
-  proxy. Bright Data Web Unlocker is an equivalent alternative.
-
-**Tailscale:** free (<https://tailscale.com>), connects the coordinator and VPSs privately.
-
----
-
-## 3. Coordinator setup (your PC, one time)
-
-Tested end to end on **macOS and Linux**. Windows should work with Docker Desktop,
-Python, git and Tailscale installed (run the same `scraper ...` commands in
-PowerShell), but it was not tested, so prefer macOS or Linux for the coordinator if
-you can. You need **Docker**, **Python 3.11+ (with pip)**, **git**, and
-**Tailscale** installed first. On a fresh Linux box:
-`apt update && apt install -y python3-pip git docker.io`.
+Rent one Ubuntu 22.04 server, then connect to it (`ssh root@SERVER_IP`) and paste these
+blocks one at a time.
 
 ```bash
-# 1. Install Tailscale and sign in, then confirm you have an IP:
-tailscale ip -4            # note this address, it is your <COORDINATOR_IP>
+# Install the basics
+apt update && apt install -y python3-pip git docker.io curl
 
-# 2. Get the code and the CLI
+# Join the private network (Tailscale). Open the link it prints to sign in.
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+tailscale ip -4          # write down the 100.x.y.z address it prints, you need it for workers
+
+# Get the program
 git clone https://github.com/fabienbrocklesby/ebay-scraper.git
 cd ebay-scraper
-python3 -m pip install -e .            # installs the `scraper` command
-#   (Linux may need:  python3 -m pip install -e . --break-system-packages)
+pip install -e . --break-system-packages
 
-# 3. Start the coordinator services (Redis + Postgres in Docker) and the database
+# Start the manager's services and database
 scraper coordinator start
 scraper connect localhost
 scraper db init
-
-# 4. Set the proxy once (every worker picks it up automatically) and test it
-scraper proxy set "<PROXY_URL>"
-scraper proxy test                     # should print: OK  Proxy working. Scraped: ...
 ```
 
-The coordinator is ready. Keep this machine on while scraping; the workers need
-its Redis and Postgres.
+Now paste your credentials. This command asks for your IPRoyal proxy link, tests it, then
+asks if you want to add the Oxylabs master key (say yes, paste username and password):
+
+```bash
+scraper setup
+```
+
+It will tell you which countries your proxy is clean for, and that any flagged ones are
+covered by Oxylabs. That is normal and fine.
+
+Check everything is healthy:
+
+```bash
+scraper doctor
+```
+
+You want green `[OK ]` on Redis, Postgres, Proxy, and Unblocker. Workers will show 0 for
+now (you add them next).
+
+Finally, get the exact command to run on your workers and copy it somewhere:
+
+```bash
+scraper coordinator info
+```
+
+Leave the Coordinator running. It is the manager; the workers need it on.
 
 ---
 
-## 4. Worker VPS setup (repeat for each worker)
+## 4. Set up each Worker (repeat for every worker server)
 
-Any cheap Linux VPS (Ubuntu 22.04 / Debian 12). One worker ≈ one IP's worth of
-speed; add more for more speed. SSH in as root, then:
+Rent another Ubuntu 22.04 server, connect to it, and paste:
 
 ```bash
-# 1. Tailscale (same account as the coordinator)
+# Basics + private network (same Tailscale account as the Coordinator)
+apt update && apt install -y python3-pip git docker.io curl
 curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up                           # open the printed URL once to authorise
+tailscale up
 
-# 2. Tools + the code + the CLI
-apt update && apt install -y python3-pip git docker.io
-git clone https://github.com/fabienbrocklesby/ebay-scraper.git /root/ebay-scraper
-cd /root/ebay-scraper
-python3 -m pip install -e . --break-system-packages
-
-# 3. One command sets up and starts the worker (builds the Docker image and runs it)
-scraper init <COORDINATOR_IP> --proxy "<PROXY_URL>"
+# Get the program
+git clone https://github.com/fabienbrocklesby/ebay-scraper.git
+cd ebay-scraper
+pip install -e . --break-system-packages
 ```
 
-That is it. `scraper init` writes the config, builds the worker image, and starts
-the worker container with `--restart=always` (survives reboots). The worker is now
-pulling jobs. Repeat on every VPS; they all share the one queue and the one proxy.
+Then run **the command that `scraper coordinator info` printed** in the last step (it
+looks like `scraper init 100.x.y.z ...`). That one command sets the worker up, points it
+at the Coordinator, and starts it. The worker now pulls jobs automatically and picks up
+the proxy and Oxylabs settings from the Coordinator on its own.
 
-Confirm from the **coordinator**:
+That's the whole worker. Want it faster? Spin up another server and do this section again.
+There is no limit; they all share one to-do list.
+
+Back on the Coordinator, confirm a worker has joined:
+
 ```bash
-scraper scrape status                  # workers show up; queued jobs fall as they work
+scraper doctor       # Workers should now show 1 (or more) connected
 ```
 
 ---
 
-## 5. Daily use (all on the coordinator)
+## 5. Run it (this is the daily part, all on the Coordinator)
 
-> **Simplest path:** put your store URLs in a file and run `scraper run stores.txt`. It imports, scrapes, and writes split CSVs to `exports/` in one command, no niche tag required. The detailed commands below give more control (filtering by niche, running delta, etc.).
+1. Make a plain text file of shop links, **one per line**. Any country, no tags. Both
+   `https://www.ebay.com/str/SHOPNAME` and the seller-search form
+   `https://www.ebay.com/sch/i.html?_ssn=SELLERNAME` work.
 
-### Add stores (two ways, your choice)
+   ```bash
+   nano stores.txt
+   # paste your links, one per line, then Ctrl+O Enter Ctrl+X to save
+   ```
 
-```bash
-# one at a time (--niche is required for store add; use scraper run if you don't need niche tagging)
-scraper store add https://www.ebay.com/str/STORENAME --niche tools
+2. Run it:
 
-# or bulk, from a text file (one store per line: "URL" or "URL,niche")
-scraper store import stores.txt --niche tools
-scraper store list
-```
+   ```bash
+   scraper run stores.txt
+   ```
 
-`stores.txt` format (blank lines and `#` comments ignored; a line's own niche
-wins, `--niche` is the default for lines without one):
-```
-# my stores
-https://www.ebay.com/str/store-one,tools
-https://www.ebay.com/str/store-two,sound
-https://www.ebay.com/sch/i.html?_ssn=SELLERNAME      # a seller-search URL also works
-```
-Both `/str/STORENAME` store URLs and `/sch/i.html?_ssn=SELLERNAME` seller-search
-URLs work. Use the seller-search form if a store's page does not list items (some
-sellers' store name differs from their username).
+That's it. It imports the shops, works out each one's country, scrapes every product, and
+writes spreadsheet files into an `exports/` folder. While it runs it prints each shop as
+`OK` (found and scraping), `unresolved` (couldn't read it this time, saved to retry), or
+`blocked`. At the end it prints a summary (shops done, products, files written).
 
-### Scrape, check, export
+Get your files:
 
 ```bash
-scraper scrape start                   # crawl every registered store, queue all items
-scraper scrape start --niche tools     # or just one niche
-scraper scrape retry                   # re-run only the stores that returned 0 last time
-scraper scrape status                  # progress: queued jobs + totals
-scraper export --output products.csv   # write the CSV (everything)
-scraper export --niche tools --output tools.csv
+ls exports/          # products_001.csv, products_002.csv, ...
 ```
 
-`scrape start` reports every store as **OK (N items)**, **0 results**, or **BLOCKED**,
-and saves anything that returned nothing to `~/.config/ebay-scraper/failed_stores.txt`.
-A "0 results" store is usually a flagged-IP fake-empty, not a truly empty store (see
-section 10). Just run **`scraper scrape retry`** a bit later (fresh IPs recover most of
-them); repeat until the list is small. This is normal at scale, not a failure.
+Each row has: title, price, currency, condition, description, the **full image gallery**
+(full-resolution links), item link, brand/model and other specifics, and more, exactly
+what Shopify needs.
 
-### Keep it fresh cheaply (after the first full scrape)
+> **The spreadsheets are multi-currency.** Because shops span US/UK/Australia, the
+> `currency` column is a mix of USD, AUD, GBP. Each price is correct for its own country.
+> Before importing into one Shopify store, split or convert the prices by the `currency`
+> column, otherwise a $20 AUD item would import as $20 USD.
+
+### Keeping it fresh later (optional, cheap)
+
+After the first full run, you don't need to re-scrape everything to stay current:
 
 ```bash
-scraper scrape delta                   # re-checks listings, only re-scrapes new/changed
+scraper scrape delta        # only re-checks for new items and price changes
 ```
-Run `scrape start` once per store to build the catalogue, then `scrape delta` on a
-schedule (e.g. a daily cron) to keep prices and new items current for almost no cost.
 
-### Tidy up
+### If some shops came back "unresolved"
+
+That just means the tool couldn't confidently read them on that pass (usually a busy
+proxy). Run this later and it retries only those:
 
 ```bash
-scraper scrape stop                    # cancel pending jobs
-scraper clear --niche tools            # delete scraped rows for a niche
-scraper store remove <url>             # unregister a store
+scraper scrape retry
 ```
 
 ---
 
-## 6. A 10-minute demo you can run right now
+## 6. Cost (real numbers)
 
-These three real stores were used to validate the tool (one of them is a
-seller-search URL):
-
-```bash
-scraper store add https://www.ebay.com/str/tool007tool --niche tools
-scraper store add https://www.ebay.com/str/onlinesound --niche sound
-scraper store add "https://www.ebay.com/sch/i.html?_ssn=redtiger_store" --niche tech
-scraper scrape start
-# wait a couple of minutes, watch it work:
-scraper scrape status
-scraper export --output demo.csv
-```
-Open `demo.csv`: each row has title, price, the **full image gallery** (full-res
-URLs, pipe-separated), the description, and the item URL.
+- **Servers:** ~$5/month each, or pennies/hour. One worker scrapes ~190,000 products/day.
+  Rent more for a big run, delete them after.
+- **IPRoyal:** about **1 GB per ~7,000 products**, roughly **$2/GB** in bulk, so about
+  **$30 per 100,000 products**. Buy a bulk traffic package for large runs.
+- **Oxylabs:** used mainly to identify each shop's country, about **3 requests per shop,
+  one time**, roughly **$6 across 1,500 shops**. Tiny. (It only does heavy lifting if
+  your proxy is badly flagged for a country.)
 
 ---
 
-## 7. Speed and cost (real measured numbers)
+## 7. If something looks wrong
 
-- **Throughput:** ~2.2 items/sec per VPS at the default settings, through the proxy.
-  You can push a single VPS higher by raising its rate (the proxy rotates IPs, so
-  there is no single-IP limit), and you add VPSs for linear speed. Rough planning:
-  one default VPS does ~190k items/day; ten do ~1.9M/day.
-- **Time estimate:** items to scrape ÷ (2.2 × number_of_VPSs) seconds. Example:
-  100,000 items on 5 VPSs ≈ 100000 / (2.2 × 5) ≈ 2.5 hours.
-- **Proxy cost:** ~135 KB on the wire per item, so about **1 GB per ~7,000 items**.
-  At bulk IPRoyal rates (~$2/GB) that is roughly **$30 per 100,000 items**, or
-  ~$1,400 for 5 million. Buy a bulk traffic package, not pay-as-you-go, for big runs.
-- **Tuning per VPS** (set as environment variables, or edit the worker's
-  `~/.config/ebay-scraper/.env` and `docker restart ebay-scraper-worker`):
-  `WORKER_CONCURRENCY` (default 8, parallel fetches), `MAX_RPS_PER_IP` (default 6),
-  `BATCH_SIZE` (default 200).
-
----
-
-## 8. Updating to a new version
-
-On the coordinator and on each VPS:
-```bash
-cd ebay-scraper            # or /root/ebay-scraper on a VPS
-git pull
-python3 -m pip install -e . --break-system-packages    # coordinator: drop the flag if not needed
-```
-On the **coordinator**, after pulling, always run:
-```bash
-scraper db init            # idempotent: applies any new database columns a new version adds
-```
-This is required when upgrading an existing install. A new version may add columns to
-the database (the marketplace-detection columns, for example); `scraper db init` adds
-them safely and does nothing if they already exist. Skipping it causes a
-"column ... does not exist" error on the next run.
-
-On each VPS, also rebuild and restart the worker after pulling:
-```bash
-scraper init <COORDINATOR_IP> --proxy "<PROXY_URL>"     # rebuilds + restarts the worker
-```
+- **`scraper doctor` shows Proxy flagged for a country.** Normal. Oxylabs covers it. As
+  long as Proxy shows `[OK ]` (clean for at least one country) and Unblocker shows
+  `[OK ]`, you are fine.
+- **Lots of shops come back "unresolved."** Your proxy account may be worn out for a
+  country (often from heavy testing). Easiest fix: get a **fresh IPRoyal account/pool**.
+  Make sure Oxylabs is set up (`scraper setup`), which also covers it.
+- **Jobs do nothing / a "402" appears.** IPRoyal is out of credit. Top it up.
+- **A worker isn't joining.** On the worker run `tailscale status` (should list the
+  Coordinator) and `docker logs ebay-scraper-worker`. On the Coordinator,
+  `scraper doctor` shows the live picture.
+- **Updating to a newer version** (on the Coordinator and each worker):
+  ```bash
+  cd ebay-scraper && git pull && pip install -e . --break-system-packages
+  scraper db init           # Coordinator only; safely adds any new database fields
+  ```
+  On each worker, also re-run the `scraper init ...` command after pulling.
 
 ---
 
-## 9. Troubleshooting
+## 8. Honest limits (no surprises)
 
-- **`proxy test` fails / jobs do nothing and logs show "402".** The IPRoyal account
-  is out of bandwidth. Top it up.
-- **A store scrapes 0 items.** That store may be empty/inactive, or its page is a
-  storefront landing page. Try the seller-search URL form
-  `https://www.ebay.com/sch/i.html?_ssn=SELLERNAME`.
-- **`scrape start` says a store was BLOCKED.** eBay challenged the coordinator's IP
-  during the crawl. Make sure the proxy is set (`scraper proxy set`) and re-run; the
-  crawl routes through the proxy and retries. Already-queued items are not lost.
-- **Worker not picking up jobs.** On the VPS, `docker logs ebay-scraper-worker` and
-  check `tailscale status` lists the coordinator. On the coordinator,
-  `scraper coordinator status` should show Redis and Postgres up.
-- **macOS coordinator, worker run locally crashes with an `objc fork()` error.**
-  Only affects running a worker directly on a Mac. Start it with
-  `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES scraper worker start`. Production workers
-  run on Linux and are unaffected.
-
----
-
-## 10. Honest limits (so there are no surprises)
-
-- **Stores on non-US marketplaces (the old "fake 0 results" stores).** What looked like
-  an anti-bot "fake empty" page turned out to be a **marketplace mismatch**: those sellers
-  live on a non-US eBay (e.g. Australian sellers on `ebay.com.au`), and eBay only serves a
-  seller's full item grid on their home domain to an in-country viewer. The scraper now
-  **auto-detects each store's home marketplace** (US/AU/UK) and routes to it with a
-  country-matched proxy IP, so you no longer tag stores with a location. You just drop a
-  plain URL list and run `scraper run`.
-  - Detection is **honest**: if it cannot confidently determine a seller's home (because
-    the proxy could not get a clean read on the other marketplaces), it does **not** guess
-    and risk scraping the wrong currency. It marks the store **UNRESOLVED** and saves it to
-    `~/.config/ebay-scraper/failed_stores.txt` for a later `scraper scrape retry`.
-  - Detection needs a clean read on each candidate marketplace. With a **healthy
-    residential proxy** this is free (the proxy itself reads each marketplace). If your
-    proxy's IPs for a given country are reputation-flagged (challenged by eBay), detection
-    for those falls back to the optional **unblocker** if you configured one in
-    `scraper setup` (Oxylabs); this costs only about 3 requests per store, one time
-    (~$6 across ~1,500 stores), and routing is then reliable regardless of proxy health.
-    Bulk item scraping still runs through the cheap proxy.
-  - **Practical tip:** if a lot of stores come back UNRESOLVED, your proxy account is
-    likely reputation-flagged for that country (often from heavy prior testing). Try a
-    **fresh proxy account / pool** first, that is the cheapest fix, before reaching for the
-    unblocker.
-- **Cost scales with proxy bandwidth on VPS workers.** Millions of items is doable
-  but the proxy bill is real (section 7). The cheap-but-fiddly alternative is to run
-  workers on residential-IP machines (no proxy needed), but eBay challenges a single
-  residential IP after a few thousand fast requests, so that needs several machines
-  at a modest rate. For a big one-off run, paying for proxy bandwidth is simplest.
-- **eBay's per-store ceiling.** eBay stops paginating a store after ~10,000 items.
-  Stores bigger than that are split by price range automatically, but it is an eBay
-  limit, not a bug here.
-- **The tool never fakes success.** A blocked crawl fails loudly with a message; it
-  does not return a partial list pretending it finished.
+- **It tells the truth.** If it can't confidently read a shop, it marks it `unresolved`
+  and saves it for retry rather than guessing and giving you wrong-country prices.
+- **Some shops are on non-US eBay** (e.g. Australian sellers on ebay.com.au). The tool
+  finds and routes these automatically; that is the whole point of the marketplace
+  detection. It needs either a proxy that can read that country, or Oxylabs configured, so
+  set up Oxylabs and you're covered.
+- **eBay caps a single shop at ~10,000 items.** Bigger shops are split by price
+  automatically. That's an eBay limit, not a bug.
+- **Cost scales with how many products you pull** (proxy traffic). Millions is doable; buy
+  a bulk traffic package.
