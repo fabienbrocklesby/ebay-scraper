@@ -7,10 +7,13 @@ returns the most items. A bot-challenge during a probe is retried, never read as
 because conflating the two would mis-detect a seller's home as empty.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 from scraper.fetch import ChallengeError, apply_proxy_country, build_session, is_challenge_page
 from scraper.store import _extract_item_urls
@@ -61,7 +64,7 @@ def _default_fetch(url: str, proxy_url: Optional[str]) -> str:
     try:
         session.get(f"https://{host}/", timeout=30)  # warm the session (cold = 403)
         resp = session.get(url, timeout=40)
-    except Exception as exc:  # network/proxy failure: treat as a soft block, let caller retry
+    except Exception as exc:  # network/proxy errors become the unified ChallengeError retry signal so _probe_domain stays agnostic to failure type
         raise ChallengeError(f"probe network error for {url}: {exc}") from exc
     return resp.text
 
@@ -82,11 +85,13 @@ def _probe_domain(
     for _ in range(_MAX_PROBE_RETRIES):
         try:
             html = fetch_fn(url, proxy_url)
-        except ChallengeError:
+        except ChallengeError as exc:
+            logger.debug("probe challenged, retrying: %s", exc)
             continue
         if is_challenge_page(html):
             continue
         return _Probe(domain, country, len(_extract_item_urls(html)), url, challenged=False)
+    logger.debug("domain undetermined after retries: %s", domain)
     return _Probe(domain, country, 0, url, challenged=True)
 
 
@@ -94,8 +99,10 @@ def detect_marketplace(
     seller_id: str,
     proxy_url: Optional[str],
     fetch_fn: FetchFn = _default_fetch,
-    candidates: list[tuple[str, str]] = CANDIDATE_MARKETPLACES,
+    candidates: Optional[list[tuple[str, str]]] = None,
 ) -> DetectionOutcome:
+    if candidates is None:
+        candidates = CANDIDATE_MARKETPLACES
     with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
         probes = list(
             pool.map(

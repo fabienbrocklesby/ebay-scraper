@@ -63,3 +63,20 @@ def test_persistent_challenge_is_undetermined():
     outcome = detect_marketplace("seller4", proxy_url=None, fetch_fn=fetch_fn)
     assert outcome.result is None
     assert set(outcome.undetermined_domains) == {d for d, _ in CANDIDATE_MARKETPLACES}
+
+
+def test_challenge_page_html_is_retried_not_counted_as_zero():
+    calls = {"n": 0}
+
+    def fetch_fn(url, proxy_url):
+        if "ebay.com.au" in url:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "<html><head><title>Security Measure | eBay</title></head></html>"
+            return _grid_html(80)
+        return _grid_html(0)
+
+    outcome = detect_marketplace("seller5", proxy_url=None, fetch_fn=fetch_fn)
+    assert outcome.result is not None
+    assert outcome.result.domain == "www.ebay.com.au"
+    assert outcome.result.item_count == 80
