@@ -11,6 +11,7 @@ from typing import Callable
 
 import asyncpg
 import click
+from rq import Worker
 
 from scraper.config import Settings
 from scraper.db import (
@@ -1066,6 +1067,11 @@ def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> 
 
     queue = get_queue(redis_conn)
     click.echo("Scraping... (waiting for the queue to drain)")
+    if not Worker.all(queue=queue):
+        click.echo(
+            "Warning: no workers connected. Start a worker (scraper worker start) "
+            "in another terminal/VPS, or this will wait indefinitely."
+        )
     while not queue_is_drained(queue):
         time.sleep(10)
         click.echo(f"  pending={queue.count} ...")
