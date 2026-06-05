@@ -7,7 +7,7 @@ call increments a Redis counter so spend is visible in run summaries.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -34,7 +34,7 @@ class UnblockerConfig:
         return self.provider == "oxylabs" and bool(self.username) and bool(self.password)
 
 
-def load_unblocker_config(redis_conn) -> UnblockerConfig:
+def load_unblocker_config(redis_conn: Any) -> UnblockerConfig:
     def _get(key: str) -> Optional[str]:
         raw = redis_conn.get(key)
         return raw.decode().strip() if raw else None
@@ -46,7 +46,7 @@ def load_unblocker_config(redis_conn) -> UnblockerConfig:
     )
 
 
-def fetch_via_unblocker(url: str, config: UnblockerConfig, redis_conn=None) -> Optional[str]:
+def fetch_via_unblocker(url: str, config: UnblockerConfig, redis_conn: Any = None) -> Optional[str]:
     if not config.enabled:
         return None
     country = _ebay_country_code(url)
@@ -69,5 +69,8 @@ def fetch_via_unblocker(url: str, config: UnblockerConfig, redis_conn=None) -> O
         redis_conn.incr(UNBLOCKER_COUNT_KEY)
     if resp.status_code != 200:
         return None
-    results = resp.json().get("results") or []
+    try:
+        results = resp.json().get("results") or []
+    except ValueError:  # malformed / non-JSON 200 body from the unblocker
+        return None
     return results[0].get("content") if results else None
