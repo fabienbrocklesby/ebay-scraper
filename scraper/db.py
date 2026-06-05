@@ -62,6 +62,9 @@ async def init_schema(pool: asyncpg.Pool) -> None:
             added_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    await pool.execute("ALTER TABLE stores ADD COLUMN IF NOT EXISTS marketplace_domain  TEXT")
+    await pool.execute("ALTER TABLE stores ADD COLUMN IF NOT EXISTS marketplace_country TEXT")
+    await pool.execute("ALTER TABLE stores ADD COLUMN IF NOT EXISTS detected_at TIMESTAMPTZ")
 
 
 async def insert_product(pool: asyncpg.Pool, record: ProductRecord) -> None:
@@ -120,9 +123,42 @@ async def add_store(pool: asyncpg.Pool, store_url: str, niche: str = "") -> None
     )
 
 
+async def set_store_marketplace(
+    pool: asyncpg.Pool, store_url: str, domain: str, country: str
+) -> None:
+    await pool.execute(
+        """
+        UPDATE stores
+           SET marketplace_domain = $2,
+               marketplace_country = $3,
+               detected_at = NOW()
+         WHERE store_url = $1
+        """,
+        store_url,
+        domain,
+        country,
+    )
+
+
+async def get_store_marketplace(
+    pool: asyncpg.Pool, store_url: str
+) -> tuple[str, str] | None:
+    row = await pool.fetchrow(
+        "SELECT marketplace_domain, marketplace_country FROM stores WHERE store_url = $1",
+        store_url,
+    )
+    if row and row["marketplace_domain"]:
+        return row["marketplace_domain"], row["marketplace_country"]
+    return None
+
+
 async def list_stores(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     return await pool.fetch(
-        "SELECT store_url, niche, added_at FROM stores ORDER BY added_at"
+        """
+        SELECT store_url, niche, added_at, marketplace_domain, marketplace_country, detected_at
+          FROM stores
+         ORDER BY added_at
+        """
     )
 
 

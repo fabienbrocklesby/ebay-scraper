@@ -6,6 +6,9 @@ from scraper.db import (
     clear_niche,
     get_store_item_prices,
     mark_items_inactive,
+    add_store,
+    set_store_marketplace,
+    get_store_marketplace,
     ProductRecord,
 )
 
@@ -107,3 +110,14 @@ async def test_products_table_has_delta_columns(db_pool):
     cols = {r["column_name"] for r in rows}
     assert "last_seen_at" in cols
     assert "is_active" in cols
+
+
+@pytest.mark.asyncio
+async def test_set_and_get_store_marketplace(db_pool):
+    await db_pool.execute("DELETE FROM stores")
+    url = "https://www.ebay.com/str/aussiestore"
+    await add_store(db_pool, url)
+    assert await get_store_marketplace(db_pool, url) is None
+    await set_store_marketplace(db_pool, url, "www.ebay.com.au", "au")
+    got = await get_store_marketplace(db_pool, url)
+    assert got == ("www.ebay.com.au", "au")
