@@ -1,10 +1,12 @@
 import asyncio
 import json
+import logging
 import shutil
 import subprocess
 import sys
 from importlib.resources import as_file, files
 from pathlib import Path
+from typing import Callable
 
 import asyncpg
 import click
@@ -22,10 +24,12 @@ from scraper.marketplace import (
 from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
 from scraper.store import (
-    _normalize_store_url, extract_seller_id, get_item_urls_from_store,
+    _normalize_store_url, _extract_item_urls, extract_seller_id, get_item_urls_from_store,
 )
-from scraper.unblocker import load_unblocker_config
+from scraper.unblocker import fetch_via_unblocker, load_unblocker_config
 from scraper.worker import start_worker
+
+logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path.home() / ".config" / "ebay-scraper"
 _COMPOSE_PROJECT = "ebay-scraper"
@@ -552,7 +556,13 @@ def _marketplace_seller_search(domain: str, seller_id: str) -> str:
     return f"https://{domain}/sch/i.html?_ssn={seller_id}"
 
 
-def _resolve_marketplace_url(store_url, cached, detect, proxy_url, on_detected=None):
+def _resolve_marketplace_url(
+    store_url: str,
+    cached: tuple[str, str] | None,
+    detect: Callable[[str, str | None], "DetectionOutcome"],
+    proxy_url: str | None,
+    on_detected: Callable[[str, str], None] | None = None,
+) -> str | None:
     """Return the seller-search URL on the store's home marketplace, or None if the
     store could not be resolved. detect(seller_id, proxy_url) -> DetectionOutcome.
     on_detected(domain, country) persists a freshly detected marketplace."""
@@ -567,8 +577,15 @@ def _resolve_marketplace_url(store_url, cached, detect, proxy_url, on_detected=N
     return None
 
 
-def _discover_store(store_url, proxy_url, rps, cached=None, on_detected=None,
-                    unblocker_config=None, redis_conn=None):
+def _discover_store(
+    store_url: str,
+    proxy_url: str | None,
+    rps: float,
+    cached: tuple[str, str] | None = None,
+    on_detected: Callable[[str, str], None] | None = None,
+    unblocker_config=None,
+    redis_conn=None,
+) -> tuple[str, list[str]]:
     """Resolve a store's home marketplace, then crawl item URLs from that domain.
 
     eBay serves each seller's listings on their home marketplace (.com, .com.au,
@@ -580,11 +597,8 @@ def _discover_store(store_url, proxy_url, rps, cached=None, on_detected=None,
     "ok", "empty", or "blocked": a crawl ChallengeError is "blocked", a clean crawl
     with no items is "empty".
     """
-    detect = lambda seller_id, p: detect_marketplace(seller_id, p)
-    resolved = _resolve_marketplace_url(store_url, cached, detect, proxy_url, on_detected)
+    resolved = _resolve_marketplace_url(store_url, cached, detect_marketplace, proxy_url, on_detected)
     if resolved is None and unblocker_config is not None and unblocker_config.enabled:
-        from scraper.unblocker import fetch_via_unblocker
-        from scraper.store import _extract_item_urls
         seller_id = extract_seller_id(store_url)
         for domain, _country in CANDIDATE_MARKETPLACES:
             html = fetch_via_unblocker(_marketplace_seller_search(domain, seller_id),
@@ -601,21 +615,26 @@ def _discover_store(store_url, proxy_url, rps, cached=None, on_detected=None,
     return ("ok" if urls else "empty", urls)
 
 
-async def _load_cached_marketplaces(store_urls):
+async def _load_cached_marketplaces(store_urls: list[str]) -> dict[str, tuple[str, str]]:
     settings = Settings()
     pool = await asyncpg.create_pool(settings.database_url)
     try:
-        out = {}
-        for url in store_urls:
-            got = await get_store_marketplace(pool, url)
-            if got:
-                out[url] = got
-        return out
+        rows = await pool.fetch(
+            """
+            SELECT store_url, marketplace_domain, marketplace_country
+              FROM stores
+             WHERE store_url = ANY($1::text[]) AND marketplace_domain IS NOT NULL
+            """,
+            store_urls,
+        )
+        return {
+            r["store_url"]: (r["marketplace_domain"], r["marketplace_country"]) for r in rows
+        }
     finally:
         await pool.close()
 
 
-async def _save_marketplace(store_url, domain, country):
+async def _save_marketplace(store_url: str, domain: str, country: str) -> None:
     settings = Settings()
     pool = await asyncpg.create_pool(settings.database_url)
     try:
@@ -624,8 +643,11 @@ async def _save_marketplace(store_url, domain, country):
         await pool.close()
 
 
-def _persist(url, domain, country):
-    asyncio.run(_save_marketplace(url, domain, country))
+def _persist(url: str, domain: str, country: str) -> None:
+    try:
+        asyncio.run(_save_marketplace(url, domain, country))
+    except Exception as exc:  # caching the marketplace is best-effort; never abort discovery
+        logger.warning("failed to persist marketplace for %s: %s", url, exc)
 
 
 def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
