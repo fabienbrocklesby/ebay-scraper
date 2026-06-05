@@ -4,6 +4,23 @@ import pytest
 from scraper.cli import _parse_store_lines
 
 
+def test_parse_store_lines_no_niche_defaults_empty():
+    text = "# header\nhttps://www.ebay.com/str/one\n\nhttps://www.ebay.com.au/str/two\n"
+    out = _parse_store_lines(text, default_niche="")
+    assert out == [
+        ("https://www.ebay.com/str/one", ""),
+        ("https://www.ebay.com.au/str/two", ""),
+    ]
+
+
+def test_run_command_registered():
+    from click.testing import CliRunner
+    from scraper.cli import cli
+    result = CliRunner().invoke(cli, ["run", "--help"])
+    assert result.exit_code == 0
+    assert "rows-per-file" in result.output
+
+
 def test_parse_store_lines_mixed_niches():
     text = """
 # comment line ignored

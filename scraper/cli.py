@@ -4,6 +4,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import time
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Callable
@@ -16,17 +17,17 @@ from scraper.db import (
     add_store, clear_niche, get_counts, get_store_marketplace, init_schema,
     list_stores, remove_store, set_store_marketplace,
 )
-from scraper.export import export_to_csv
+from scraper.export import export_to_csv, export_split_csv
 from scraper.fetch import ChallengeError
 from scraper.marketplace import (
     CANDIDATE_MARKETPLACES, DetectionOutcome, detect_marketplace,
 )
-from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
+from scraper.queue import enqueue_items, get_queue, get_redis, queue_is_drained, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
 from scraper.store import (
     _normalize_store_url, _extract_item_urls, extract_seller_id, get_item_urls_from_store,
 )
-from scraper.unblocker import fetch_via_unblocker, load_unblocker_config
+from scraper.unblocker import fetch_via_unblocker, load_unblocker_config, UNBLOCKER_COUNT_KEY
 from scraper.worker import start_worker
 
 logger = logging.getLogger(__name__)
@@ -437,7 +438,7 @@ def _parse_store_lines(text: str, default_niche: str | None) -> list[tuple[str, 
         parts = [p.strip() for p in line.split(",", 1)]
         url = parts[0]
         niche = parts[1] if len(parts) > 1 and parts[1] else default_niche
-        if not niche:
+        if niche is None:
             raise click.ClickException(
                 f"Line {lineno}: no niche for '{url}'. Add ',<niche>' or pass --niche."
             )
@@ -1011,6 +1012,70 @@ def export(output: str, niche: str | None) -> None:
             await pool.close()
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# run (end-to-end orchestrator)
+# ---------------------------------------------------------------------------
+
+
+async def _import_stores(stores: list[tuple[str, str]]) -> None:
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url)
+    try:
+        for store_url, niche in stores:
+            await add_store(pool, _canonical_store_url(store_url), niche)
+    finally:
+        await pool.close()
+
+
+async def _export_split_csv_all(export_dir: str, rows_per_file: int) -> list[str]:
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url)
+    try:
+        return await export_split_csv(pool, export_dir, rows_per_file=rows_per_file, niche=None)
+    finally:
+        await pool.close()
+
+
+@cli.command()
+@click.argument("store_file", type=click.Path(exists=True))
+@click.option("--export-dir", default="exports", help="Directory for the output CSV files.")
+@click.option("--rows-per-file", default=500_000, type=int, help="Max rows per CSV file.")
+@click.option("--no-wait", is_flag=True, help="Queue scraping and exit without waiting/exporting.")
+def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> None:
+    """Import a store-URL file, scrape every product across all marketplaces, write CSVs."""
+    settings = Settings()
+    text = Path(store_file).read_text()
+    stores = _parse_store_lines(text, default_niche="")
+    click.echo(f"Loaded {len(stores)} stores from {store_file}")
+
+    asyncio.run(_import_stores(stores))
+
+    redis_conn = get_redis(settings.redis_url)
+    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
+    proxy_url = proxy_url or None
+
+    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
+    _report_discovery(ok, empty, blocked, total_queued)
+
+    if no_wait:
+        click.echo("Queued. Exiting without waiting (--no-wait).")
+        return
+
+    queue = get_queue(redis_conn)
+    click.echo("Scraping... (waiting for the queue to drain)")
+    while not queue_is_drained(queue):
+        time.sleep(10)
+        click.echo(f"  pending={queue.count} ...")
+
+    paths = asyncio.run(_export_split_csv_all(export_dir, rows_per_file))
+    unblocker_used = int(redis_conn.get(UNBLOCKER_COUNT_KEY) or 0)
+    click.echo(
+        f"Done. {len(ok)}/{len(stores)} stores OK, {total_queued} items queued, "
+        f"{unblocker_used} unblocker requests, {len(paths)} CSV files in {export_dir}/"
+    )
 
 
 # ---------------------------------------------------------------------------
