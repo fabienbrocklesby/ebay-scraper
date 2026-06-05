@@ -89,3 +89,14 @@ async def test_export_csv_has_all_columns(db_pool, tmp_path):
     ]
     for col in expected:
         assert col in columns, f"Missing column: {col}"
+
+
+@pytest.mark.asyncio
+async def test_export_renders_null_field_as_empty_string(db_pool, tmp_path):
+    """NULL values in the DB must export as "" not the literal string "None"."""
+    await insert_product(db_pool, make_record(item_id="nul1", niche="nulltest", mpn=None))
+    output = tmp_path / "out.csv"
+    await export_to_csv(db_pool, output_path=str(output), niche="nulltest")
+    with open(output) as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["mpn"] == "", f"Expected empty string for NULL mpn, got {rows[0]['mpn']!r}"
