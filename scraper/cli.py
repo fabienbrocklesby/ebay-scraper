@@ -11,13 +11,20 @@ import click
 
 from scraper.config import Settings
 from scraper.db import (
-    add_store, clear_niche, get_counts, init_schema, list_stores, remove_store,
+    add_store, clear_niche, get_counts, get_store_marketplace, init_schema,
+    list_stores, remove_store, set_store_marketplace,
 )
 from scraper.export import export_to_csv
 from scraper.fetch import ChallengeError
+from scraper.marketplace import (
+    CANDIDATE_MARKETPLACES, DetectionOutcome, detect_marketplace,
+)
 from scraper.queue import enqueue_items, get_queue, get_redis, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
-from scraper.store import _normalize_store_url, get_item_urls_from_store
+from scraper.store import (
+    _normalize_store_url, extract_seller_id, get_item_urls_from_store,
+)
+from scraper.unblocker import load_unblocker_config
 from scraper.worker import start_worker
 
 _CONFIG_DIR = Path.home() / ".config" / "ebay-scraper"
@@ -541,30 +548,84 @@ def scrape() -> None:
 _FAILED_STORES_FILE = Path.home() / ".config" / "ebay-scraper" / "failed_stores.txt"
 
 
-def _discover_store(store_url: str, proxy_url: str | None, rps: float) -> tuple[str, list[str]]:
-    """Find a store's item URLs. Proxy first, then the coordinator's own IP.
+def _marketplace_seller_search(domain: str, seller_id: str) -> str:
+    return f"https://{domain}/sch/i.html?_ssn={seller_id}"
 
-    eBay serves most stores fine through the rotating proxy (~80% in testing), but
-    detects the proxy for a minority of stores and serves a degraded "0 results"
-    storefront to every proxy exit IP. The coordinator's genuine ISP IP gets the
-    real grid for those, so when the proxy returns 0 (or is challenged) we retry
-    once directly. Doing the proxy first keeps the bulk of the load off the
-    coordinator IP, so it stays unflagged for the minority that actually need it.
-    A direct 0 (genuine IP) is trusted as a truly empty store. Returns
-    (outcome, urls) with outcome in "ok", "empty", or "blocked".
+
+def _resolve_marketplace_url(store_url, cached, detect, proxy_url, on_detected=None):
+    """Return the seller-search URL on the store's home marketplace, or None if the
+    store could not be resolved. detect(seller_id, proxy_url) -> DetectionOutcome.
+    on_detected(domain, country) persists a freshly detected marketplace."""
+    seller_id = extract_seller_id(store_url)
+    if cached is not None:
+        return _marketplace_seller_search(cached[0], seller_id)
+    outcome = detect(seller_id, proxy_url)
+    if outcome.result is not None:
+        if on_detected is not None:
+            on_detected(outcome.result.domain, outcome.result.country)
+        return _marketplace_seller_search(outcome.result.domain, seller_id)
+    return None
+
+
+def _discover_store(store_url, proxy_url, rps, cached=None, on_detected=None,
+                    unblocker_config=None, redis_conn=None):
+    """Resolve a store's home marketplace, then crawl item URLs from that domain.
+
+    eBay serves each seller's listings on their home marketplace (.com, .com.au,
+    .co.uk, ...). Detection probes the candidate domains so the crawl hits the one
+    that actually holds the grid; a cached marketplace skips that probe. When the
+    store cannot be resolved (every probe was a degraded "0 results" view) and an
+    unblocker is configured, we probe the candidate domains through the unblocker
+    and adopt the first that yields items. Returns (outcome, urls) with outcome in
+    "ok", "empty", or "blocked": a crawl ChallengeError is "blocked", a clean crawl
+    with no items is "empty".
     """
-    if proxy_url:
-        try:
-            urls = get_item_urls_from_store(store_url, proxy_url=proxy_url, requests_per_second=rps)
-            if urls:
-                return ("ok", urls)
-        except ChallengeError:
-            pass
+    detect = lambda seller_id, p: detect_marketplace(seller_id, p)
+    resolved = _resolve_marketplace_url(store_url, cached, detect, proxy_url, on_detected)
+    if resolved is None and unblocker_config is not None and unblocker_config.enabled:
+        from scraper.unblocker import fetch_via_unblocker
+        from scraper.store import _extract_item_urls
+        seller_id = extract_seller_id(store_url)
+        for domain, _country in CANDIDATE_MARKETPLACES:
+            html = fetch_via_unblocker(_marketplace_seller_search(domain, seller_id),
+                                       unblocker_config, redis_conn)
+            if html and _extract_item_urls(html):
+                resolved = _marketplace_seller_search(domain, seller_id)
+                break
+    if resolved is None:
+        return ("empty", [])
     try:
-        urls = get_item_urls_from_store(store_url, proxy_url=None, requests_per_second=rps)
-        return ("ok", urls) if urls else ("empty", [])
+        urls = get_item_urls_from_store(resolved, proxy_url=proxy_url, requests_per_second=rps)
     except ChallengeError:
         return ("blocked", [])
+    return ("ok" if urls else "empty", urls)
+
+
+async def _load_cached_marketplaces(store_urls):
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url)
+    try:
+        out = {}
+        for url in store_urls:
+            got = await get_store_marketplace(pool, url)
+            if got:
+                out[url] = got
+        return out
+    finally:
+        await pool.close()
+
+
+async def _save_marketplace(store_url, domain, country):
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url)
+    try:
+        await set_store_marketplace(pool, store_url, domain, country)
+    finally:
+        await pool.close()
+
+
+def _persist(url, domain, country):
+    asyncio.run(_save_marketplace(url, domain, country))
 
 
 def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
@@ -576,13 +637,20 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
     """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, total_queued)."""
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
+    unblocker_config = load_unblocker_config(redis_conn)
+    cached_map = asyncio.run(_load_cached_marketplaces([s[0] for s in stores]))
     ok: list[str] = []
     empty: list[tuple[str, str]] = []
     blocked: list[tuple[str, str]] = []
     total_queued = 0
     for store_url, niche in stores:
         click.echo(f"  Crawling {store_url} ...")
-        outcome, item_urls = _discover_store(store_url, proxy_url, settings.requests_per_second)
+        outcome, item_urls = _discover_store(
+            store_url, proxy_url, settings.requests_per_second,
+            cached=cached_map.get(store_url),
+            on_detected=lambda d, c, _u=store_url: _persist(_u, d, c),
+            unblocker_config=unblocker_config, redis_conn=redis_conn,
+        )
         if outcome == "ok":
             queued = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
             total_queued += queued

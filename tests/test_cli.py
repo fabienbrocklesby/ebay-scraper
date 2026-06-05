@@ -25,31 +25,51 @@ def test_parse_store_lines_requires_a_niche():
         _parse_store_lines("https://www.ebay.com.au/str/x", default_niche=None)
 
 
-def test_discover_store_proxy_first_then_direct_fallback(monkeypatch):
-    import scraper.cli as c
-    calls = []
+def test_resolve_marketplace_url_uses_cached_domain():
+    from scraper.cli import _resolve_marketplace_url
+    url = _resolve_marketplace_url(
+        store_url="https://www.ebay.com/str/aussie",
+        cached=("www.ebay.com.au", "au"),
+        detect=lambda seller_id, proxy_url: (_ for _ in ()).throw(AssertionError("should not detect")),
+        proxy_url=None,
+    )
+    assert url == "https://www.ebay.com.au/sch/i.html?_ssn=aussie"
 
-    def fake(url, proxy_url=None, requests_per_second=0.5):
-        calls.append(proxy_url)
-        if proxy_url is not None:
-            return []   # proxy served the degraded "0 results" view
-        return ["https://www.ebay.com/itm/123456789012"]   # genuine IP gets the grid
 
-    monkeypatch.setattr(c, "get_item_urls_from_store", fake)
-    outcome, urls = c._discover_store("https://www.ebay.com/str/x", "http://proxy", 0.5)
-    assert outcome == "ok" and len(urls) == 1
-    assert calls == ["http://proxy", None]   # proxy first, then direct fallback
+def test_resolve_marketplace_url_detects_when_uncached():
+    from scraper.cli import _resolve_marketplace_url
+    from scraper.marketplace import DetectionOutcome, MarketplaceResult
+    captured = {}
+
+    def fake_detect(seller_id, proxy_url):
+        return DetectionOutcome(
+            result=MarketplaceResult("www.ebay.com.au", "au", 200,
+                                     "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=60"),
+            undetermined_domains=[],
+        )
+
+    url = _resolve_marketplace_url(
+        store_url="https://www.ebay.com/str/aussie",
+        cached=None,
+        detect=fake_detect,
+        proxy_url=None,
+        on_detected=lambda domain, country: captured.update(domain=domain, country=country),
+    )
+    assert url == "https://www.ebay.com.au/sch/i.html?_ssn=aussie"
+    assert captured == {"domain": "www.ebay.com.au", "country": "au"}
 
 
 def test_discover_store_empty_trusts_clean_zero(monkeypatch):
     import scraper.cli as c
     monkeypatch.setattr(c, "get_item_urls_from_store",
                         lambda url, proxy_url=None, requests_per_second=0.5: [])
-    # clean IP returns 0 -> genuinely empty, do not burn a proxy attempt
-    assert c._discover_store("https://www.ebay.com/str/x", "http://proxy", 0.5) == ("empty", [])
+    # cached marketplace skips detection; a clean crawl with no items is a genuinely empty store
+    assert c._discover_store(
+        "https://www.ebay.com/str/x", "http://proxy", 0.5, cached=("www.ebay.com", "us")
+    ) == ("empty", [])
 
 
-def test_discover_store_blocked_when_both_challenge(monkeypatch):
+def test_discover_store_blocked_on_crawl_challenge(monkeypatch):
     import scraper.cli as c
     from scraper.fetch import ChallengeError
 
@@ -57,4 +77,6 @@ def test_discover_store_blocked_when_both_challenge(monkeypatch):
         raise ChallengeError("blocked")
 
     monkeypatch.setattr(c, "get_item_urls_from_store", fake)
-    assert c._discover_store("https://www.ebay.com/str/x", "http://proxy", 0.5)[0] == "blocked"
+    assert c._discover_store(
+        "https://www.ebay.com/str/x", "http://proxy", 0.5, cached=("www.ebay.com", "us")
+    )[0] == "blocked"
