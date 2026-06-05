@@ -1127,21 +1127,45 @@ def _redact_url(url: str) -> str:
     return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
 
 
-def _probe_proxy_ok(proxy_url: str) -> bool:
-    """Fetch a real eBay store page through the proxy; return True only if no challenge page.
+_PROXY_PROBE_MARKETS = {
+    "US": "https://www.ebay.com/sch/i.html?_nkw=phone&_ipg=60",
+    "AU": "https://www.ebay.com.au/sch/i.html?_nkw=phone&_ipg=60",
+    "UK": "https://www.ebay.co.uk/sch/i.html?_nkw=phone&_ipg=60",
+}
 
-    The broad except is intentional: any failure (network, timeout, DNS, etc.) means
-    the proxy is not usable for scraping, and the wizard must report red rather than crash.
+
+def _probe_proxy_markets(proxy_url: str) -> dict[str, bool]:
+    """Probe the proxy against each marketplace; return {country: clean_grid_returned}.
+
+    A residential pool can be challenge-flagged by eBay for one country while clean for
+    another. The scraper covers flagged countries via the unblocker, so this reports each
+    country separately rather than a single pass/fail.
     """
     from scraper.fetch import apply_proxy_country, build_session, is_challenge_page
-    target = "https://www.ebay.com/sch/i.html?_ssn=onlinesound&_pgn=1&_ipg=60"
-    try:
-        session = build_session(apply_proxy_country(proxy_url, target))
-        session.get("https://www.ebay.com/", timeout=30)
-        resp = session.get(target, timeout=40)
-        return not is_challenge_page(resp.text)
-    except Exception:  # noqa: BLE001
-        return False
+    from scraper.store import _extract_item_urls
+
+    results: dict[str, bool] = {}
+    for country, url in _PROXY_PROBE_MARKETS.items():
+        try:
+            session = build_session(apply_proxy_country(proxy_url, url))
+            session.get(url.split("/sch")[0] + "/", timeout=30)
+            resp = session.get(url, timeout=40)
+            results[country] = (not is_challenge_page(resp.text)) and bool(
+                _extract_item_urls(resp.text)
+            )
+        except Exception:  # noqa: BLE001
+            results[country] = False
+    return results
+
+
+def _probe_proxy_ok(proxy_url: str) -> bool:
+    """True if the proxy can fetch a clean eBay grid on at least one marketplace.
+
+    A proxy flagged for some countries but clean for others is still usable: the scraper
+    routes flagged countries through the unblocker. Only a proxy that fails ALL three
+    marketplaces (or is unreachable) is unusable.
+    """
+    return any(_probe_proxy_markets(proxy_url).values())
 
 
 def _probe_unblocker_ok(username: str, password: str) -> bool:
@@ -1168,15 +1192,29 @@ def setup() -> None:
     redis_conn = get_redis(settings.redis_url)
 
     proxy_url = click.prompt("Residential proxy URL (http://user:pass@host:port)")
-    click.echo("  testing proxy against eBay ...")
-    if _probe_proxy_ok(proxy_url):
-        redis_conn.set(PROXY_REDIS_KEY, proxy_url)
-        click.echo("  proxy OK and saved.")
-    else:
-        click.echo("  proxy FAILED (challenge or error). Not saved. Re-run setup.")
+    click.echo("  testing proxy against eBay (US / AU / UK) ...")
+    markets = _probe_proxy_markets(proxy_url)
+    for country, ok in markets.items():
+        click.echo(f"    {country}: {'clean' if ok else 'flagged (will use the unblocker)'}")
+    clean = [c for c, ok in markets.items() if ok]
+    if not clean:
+        click.echo(
+            "  proxy FAILED on every marketplace (unreachable, out of credit, or fully "
+            "flagged). Not saved. Check the proxy and re-run setup."
+        )
         return
+    redis_conn.set(PROXY_REDIS_KEY, proxy_url)
+    click.echo(f"  proxy saved. Clean for: {', '.join(clean)}.")
+    all_clean = len(clean) == len(markets)
+    if not all_clean:
+        click.echo(
+            "  NOTE: some marketplaces are flagged on this proxy. Add the Oxylabs "
+            "unblocker below so stores on those marketplaces still get found."
+        )
 
-    if click.confirm("Add an optional Oxylabs unblocker fallback?", default=False):
+    if click.confirm(
+        "Add the Oxylabs unblocker (recommended)?", default=not all_clean
+    ):
         user = click.prompt("Oxylabs username")
         pw = click.prompt("Oxylabs password", hide_input=True)
         click.echo("  testing unblocker ...")
@@ -1233,7 +1271,13 @@ def doctor() -> None:
 
     proxy_url = resolve_proxy(redis_conn, settings)
     if proxy_url:
-        line("Proxy", _probe_proxy_ok(proxy_url), "live eBay fetch")
+        markets = _probe_proxy_markets(proxy_url)
+        clean = [c for c, ok in markets.items() if ok]
+        detail = "clean: " + (", ".join(clean) if clean else "none") + (
+            "  (flagged: " + ", ".join(c for c, ok in markets.items() if not ok) + ", covered by unblocker)"
+            if clean and len(clean) < len(markets) else ""
+        )
+        line("Proxy", bool(clean), detail)
     else:
         line("Proxy", False, "not configured (run `scraper setup`)")
 

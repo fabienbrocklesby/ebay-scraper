@@ -190,3 +190,15 @@ def test_wait_for_drain_aborts_without_workers(monkeypatch):
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     with pytest.raises(click.ClickException):
         cli._wait_for_drain(types.SimpleNamespace(count=0))
+
+
+def test_probe_proxy_ok_true_if_any_marketplace_clean(monkeypatch):
+    from scraper import cli
+    monkeypatch.setattr(cli, "_probe_proxy_markets", lambda p: {"US": False, "AU": True, "UK": False})
+    assert cli._probe_proxy_ok("http://x") is True
+
+
+def test_probe_proxy_ok_false_if_all_marketplaces_flagged(monkeypatch):
+    from scraper import cli
+    monkeypatch.setattr(cli, "_probe_proxy_markets", lambda p: {"US": False, "AU": False, "UK": False})
+    assert cli._probe_proxy_ok("http://x") is False
