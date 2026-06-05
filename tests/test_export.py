@@ -55,6 +55,26 @@ async def test_export_no_niche_exports_all(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_export_split_csv_chunks_by_rows(db_pool, tmp_path):
+    from scraper.db import insert_product
+    from scraper.export import export_split_csv
+    for i in range(5):
+        await insert_product(db_pool, make_record(item_id=f"s{i}", niche="split"))
+    paths = await export_split_csv(
+        db_pool, output_dir=str(tmp_path), rows_per_file=2, niche="split"
+    )
+    assert len(paths) == 3  # 2 + 2 + 1
+    import csv as csv_mod
+    total = 0
+    for p in paths:
+        with open(p) as f:
+            rows = list(csv_mod.DictReader(f))
+            total += len(rows)
+            assert "item_id" in rows[0]  # header present in every file
+    assert total == 5
+
+
+@pytest.mark.asyncio
 async def test_export_csv_has_all_columns(db_pool, tmp_path):
     await insert_product(db_pool, make_record(item_id="ex4", niche="cols"))
     output = tmp_path / "cols.csv"
