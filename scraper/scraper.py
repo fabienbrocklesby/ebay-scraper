@@ -180,6 +180,74 @@ def _extract_gallery_images(soup: BeautifulSoup, ld_json: dict) -> list[str]:
     return list(images)
 
 
+def parse_item_html(
+    html: str,
+    item_url: str,
+    client: Optional[Any] = None,
+    proxy_url: Optional[str] = None,
+) -> Optional[ProductData]:
+    """Parse an eBay item page HTML string and return structured product data.
+
+    Separated from the network fetch so that the unblocker path (which has already
+    retrieved the HTML via an external API) can reuse all parsing logic without
+    creating a second HTTP client. The description iframe fetch requires a live
+    client with session cookies; when client=None the description is left empty,
+    which is acceptable for the rare escalated tail where no session is available.
+
+    Returns None when the page has no parseable product block (e.g. a delisted
+    item that was served as a valid page with no JSON-LD). Does not detect challenge
+    pages because the caller is expected to have already verified the HTML content.
+
+    Args:
+        html: Raw HTML of an eBay item page.
+        item_url: The URL the page was fetched from (used for item ID extraction,
+            currency validation, and description iframe referer).
+        client: Optional live HTTP client for the description iframe fetch.
+        proxy_url: Used only for the wrong-country currency guard; pass the proxy
+            that was used to fetch the HTML so the check is accurate.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    ld_json = _find_product_ld(soup)
+    if not ld_json:
+        return None
+
+    offers = ld_json.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+
+    images = _extract_gallery_images(soup, ld_json)
+
+    item_specifics = _extract_item_specifics(soup)
+    item_id = _item_id_from_url(item_url)
+    description = _fetch_description(soup, client, item_url) if client else ""
+
+    currency = offers.get("priceCurrency", "")
+    expected = expected_currency(item_url)
+    if proxy_url and expected and currency and currency != expected:
+        raise WrongCountryError(
+            f"{item_url} returned {currency}, expected {expected} - proxy IP "
+            f"resolved to the wrong country; retrying on a fresh IP"
+        )
+
+    return ProductData(
+        item_id=item_id,
+        title=_clean_text(ld_json.get("name", "")),
+        price=float(offers.get("price", 0) or 0),
+        currency=currency,
+        condition=_condition_from_schema(offers.get("itemCondition", "")),
+        description=description,
+        image_urls="|".join(images),
+        item_url=item_url,
+        seller_id=(offers.get("seller") or {}).get("name", ""),
+        category=ld_json.get("category", ""),
+        item_specifics=item_specifics,
+        mpn=_extract_identifier(item_specifics, "MPN", "Manufacturer Part Number", "mpn"),
+        upc=_extract_identifier(item_specifics, "UPC", "EAN", "ISBN", "upc"),
+        shipping=_extract_shipping(soup),
+        listing_type=_extract_listing_type(soup),
+    )
+
+
 def scrape_item(
     item_url: str,
     proxy_url: Optional[str] = None,
@@ -241,46 +309,7 @@ def scrape_item(
         if is_challenge_page(response.text):
             raise ChallengeError(f"eBay challenge fetching item {item_url}")
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        ld_json = _find_product_ld(soup)
-        if not ld_json:
-            return None
-
-        offers = ld_json.get("offers", {})
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-
-        images = _extract_gallery_images(soup, ld_json)
-
-        item_specifics = _extract_item_specifics(soup)
-        item_id = _item_id_from_url(item_url)
-        description = _fetch_description(soup, client, item_url)
-
-        currency = offers.get("priceCurrency", "")
-        expected = expected_currency(item_url)
-        if proxy_url and expected and currency and currency != expected:
-            raise WrongCountryError(
-                f"{item_url} returned {currency}, expected {expected} - proxy IP "
-                f"resolved to the wrong country; retrying on a fresh IP"
-            )
-
-        return ProductData(
-            item_id=item_id,
-            title=_clean_text(ld_json.get("name", "")),
-            price=float(offers.get("price", 0) or 0),
-            currency=currency,
-            condition=_condition_from_schema(offers.get("itemCondition", "")),
-            description=description,
-            image_urls="|".join(images),
-            item_url=item_url,
-            seller_id=(offers.get("seller") or {}).get("name", ""),
-            category=ld_json.get("category", ""),
-            item_specifics=item_specifics,
-            mpn=_extract_identifier(item_specifics, "MPN", "Manufacturer Part Number", "mpn"),
-            upc=_extract_identifier(item_specifics, "UPC", "EAN", "ISBN", "upc"),
-            shipping=_extract_shipping(soup),
-            listing_type=_extract_listing_type(soup),
-        )
+        return parse_item_html(response.text, item_url, client=client, proxy_url=proxy_url)
     finally:
         if own_client and client:
             client.close()

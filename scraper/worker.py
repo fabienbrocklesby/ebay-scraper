@@ -9,9 +9,10 @@ from psycopg2.extras import execute_values
 from scraper.config import Settings
 from scraper.fetch import ChallengeError, WrongCountryError, build_session, apply_proxy_country
 from scraper.queue import PROXY_REDIS_KEY
-from scraper.scraper import scrape_item, ProductData
+from scraper.scraper import scrape_item, parse_item_html, ProductData
 from scraper.store import extract_seller_id
 from scraper.throttle import TokenBucket, BoxProxyState
+from scraper.unblocker import UnblockerConfig, fetch_via_unblocker, load_unblocker_config
 
 
 def _get_proxy_url(settings: Settings) -> str | None:
@@ -136,6 +137,38 @@ def _scrape_one(item_url: str, residential_proxy: str | None, box_state: BoxProx
         raise
 
 
+def _scrape_one_with_unblocker(
+    item_url: str,
+    residential_proxy: str | None,
+    box_state: BoxProxyState,
+    bucket: TokenBucket,
+    unblocker_config: UnblockerConfig,
+    redis_conn: Any,
+) -> Optional[ProductData]:
+    """Attempt _scrape_one and escalate to the paid unblocker on a persistent challenge.
+
+    A None return from _scrape_one (genuine 404 or unparseable page) passes through
+    without touching the unblocker: there is nothing to fetch and the paid call would
+    be wasted. Only a ChallengeError (which WrongCountryError subclasses) triggers
+    escalation. When the unblocker is disabled the exception is re-raised so
+    scrape_batch's existing requeue logic handles it unchanged.
+
+    The description iframe is not fetched on the unblocker path because the unblocker
+    returns a standalone HTML snapshot with no live session cookies. The description
+    field will be empty for these tail escalations, which is an acceptable tradeoff
+    versus abandoning the item entirely.
+    """
+    try:
+        return _scrape_one(item_url, residential_proxy, box_state, bucket)
+    except ChallengeError:
+        if unblocker_config is None or not unblocker_config.enabled:
+            raise
+        html = fetch_via_unblocker(item_url, unblocker_config, redis_conn)
+        if not html:
+            raise
+        return parse_item_html(html, item_url)
+
+
 _MAX_BATCH_ATTEMPTS = 3
 
 
@@ -156,11 +189,15 @@ def scrape_batch(item_urls: list[str], niche: str, store_url: str, attempt: int 
         settings.challenge_escalation_threshold, settings.challenge_cooldown_seconds
     )
 
+    from scraper.queue import get_redis
+    redis_conn = get_redis(settings.redis_url)
+    unblocker_config = load_unblocker_config(redis_conn)
+
     results: list[ProductData] = []
     failed: list[str] = []
     with ThreadPoolExecutor(max_workers=settings.worker_concurrency) as ex:
         futures = {
-            ex.submit(_scrape_one, url, residential, box_state, bucket): url
+            ex.submit(_scrape_one_with_unblocker, url, residential, box_state, bucket, unblocker_config, redis_conn): url
             for url in item_urls
         }
         for fut in as_completed(futures):

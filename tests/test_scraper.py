@@ -3,7 +3,7 @@ import pytest
 import respx
 import httpx
 from scraper.fetch import ChallengeError, WrongCountryError
-from scraper.scraper import scrape_item, ProductData
+from scraper.scraper import scrape_item, parse_item_html, ProductData
 
 ITEM_URL = "https://www.ebay.com/itm/123456789"
 HOMEPAGE_URL = "https://www.ebay.com/"
@@ -217,6 +217,36 @@ def test_extract_gallery_images_full_resolution():
     assert len(set(imgs)) == 12          # deduplicated
     assert all(u.startswith("https://i.ebayimg.com/images/g/") for u in imgs)
     assert all(u.endswith("/s-l1600.jpg") for u in imgs)
+
+
+def test_parse_item_html_returns_same_fields_as_scrape_item():
+    """parse_item_html must produce the same ProductData fields as scrape_item.
+
+    This is the primary regression guard for the extraction: if parse_item_html's
+    behaviour diverges from what scrape_item used to do, this test catches it.
+    The description will be empty because no client is supplied (unblocker path).
+    """
+    product = parse_item_html(SAMPLE_HTML, ITEM_URL)
+    assert isinstance(product, ProductData)
+    assert product.item_id == "123456789"
+    assert product.title == "Genuine OEM Toyota Brake Pads"
+    assert product.price == 45.99
+    assert product.currency == "USD"
+    assert product.condition == "New"
+    assert product.seller_id == "autopartsking"
+    assert product.category == "Auto Parts"
+    assert product.item_url == ITEM_URL
+    assert product.description == ""  # no client supplied on unblocker path
+    specifics = json.loads(product.item_specifics)
+    assert specifics.get("Brand") == "Toyota"
+    assert "free" in product.shipping.lower()
+    assert product.listing_type == "Buy It Now"
+
+
+def test_parse_item_html_returns_none_on_no_jsonld():
+    """A page with no product JSON-LD block must return None, not raise."""
+    result = parse_item_html("<html><body>empty</body></html>", ITEM_URL)
+    assert result is None
 
 
 def test_extract_gallery_falls_back_to_jsonld_when_no_carousel():

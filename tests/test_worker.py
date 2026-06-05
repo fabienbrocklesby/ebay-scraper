@@ -70,11 +70,21 @@ def test_scrape_one_returns_none_on_404(monkeypatch):
     assert w._scrape_one("https://www.ebay.com.au/itm/1", None, state, bucket) is None
 
 
+def _fake_unblocker_config():
+    from scraper.unblocker import UnblockerConfig
+    return UnblockerConfig(provider="none", username=None, password=None)
+
+
 def test_scrape_batch_fetches_concurrently_and_bulk_writes(monkeypatch):
     import scraper.worker as w
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
     monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
     monkeypatch.setattr(w, "_get_proxy_url", lambda s: None)
+    monkeypatch.setattr(w, "load_unblocker_config", lambda rc: _fake_unblocker_config())
+
+    # get_redis is imported inside scrape_batch via late import; patch at queue level
+    import scraper.queue as q
+    monkeypatch.setattr(q, "get_redis", lambda url: None)
 
     def fake_scrape_one(url, residential, state, bucket):
         if url.endswith("999"):
@@ -100,6 +110,11 @@ def test_scrape_batch_drops_failures_after_max_attempts(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
     monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
     monkeypatch.setattr(w, "_get_proxy_url", lambda s: None)
+    monkeypatch.setattr(w, "load_unblocker_config", lambda rc: _fake_unblocker_config())
+
+    import scraper.queue as q
+    monkeypatch.setattr(q, "get_redis", lambda url: None)
+
     monkeypatch.setattr(w, "_scrape_one", lambda *a, **k: (_ for _ in ()).throw(Exception("x")))
     monkeypatch.setattr(w, "_bulk_upsert", lambda *a, **k: None)
     called = {"requeued": False}
@@ -133,3 +148,74 @@ def test_warmed_session_warms_once_and_reuses(monkeypatch):
     s3 = w._warmed_session("http://proxy:8080", "https://www.ebay.com.au/itm/333333333333")
     assert s3 is not s1      # a different proxy gets its own warmed session
     assert len(builds) == 2
+
+
+def test_escalates_to_unblocker_on_challenge(monkeypatch):
+    import scraper.worker as worker
+    from scraper.throttle import BoxProxyState, TokenBucket
+    from scraper.unblocker import UnblockerConfig
+    from scraper.fetch import ChallengeError
+
+    def boom(*a, **k):
+        raise ChallengeError("blocked")
+    monkeypatch.setattr(worker, "_scrape_one", boom)
+    monkeypatch.setattr(worker, "fetch_via_unblocker", lambda url, cfg, rc=None: "<html>item</html>")
+    sentinel = object()
+    monkeypatch.setattr(worker, "parse_item_html", lambda html, item_url: sentinel)
+    cfg = UnblockerConfig(provider="oxylabs", username="u", password="p")
+    out = worker._scrape_one_with_unblocker(
+        "https://www.ebay.com.au/itm/1",
+        None,
+        BoxProxyState(0.15, 120),
+        TokenBucket(100),
+        cfg,
+        None,
+    )
+    assert out is sentinel
+
+
+def test_no_escalation_when_unblocker_off_reraises(monkeypatch):
+    import scraper.worker as worker
+    from scraper.throttle import BoxProxyState, TokenBucket
+    from scraper.unblocker import UnblockerConfig
+    from scraper.fetch import ChallengeError
+    import pytest
+
+    def boom(*a, **k):
+        raise ChallengeError("blocked")
+    monkeypatch.setattr(worker, "_scrape_one", boom)
+    cfg = UnblockerConfig(provider="none", username=None, password=None)
+    with pytest.raises(ChallengeError):
+        worker._scrape_one_with_unblocker(
+            "https://www.ebay.com/itm/1",
+            None,
+            BoxProxyState(0.15, 120),
+            TokenBucket(100),
+            cfg,
+            None,
+        )
+
+
+def test_404_none_passes_through_no_escalation(monkeypatch):
+    import scraper.worker as worker
+    from scraper.throttle import BoxProxyState, TokenBucket
+    from scraper.unblocker import UnblockerConfig
+
+    monkeypatch.setattr(worker, "_scrape_one", lambda *a, **k: None)
+    called = {"unblocker": False}
+
+    def track(*a, **k):
+        called["unblocker"] = True
+        return "<html/>"
+    monkeypatch.setattr(worker, "fetch_via_unblocker", track)
+    cfg = UnblockerConfig(provider="oxylabs", username="u", password="p")
+    out = worker._scrape_one_with_unblocker(
+        "https://www.ebay.com/itm/1",
+        None,
+        BoxProxyState(0.15, 120),
+        TokenBucket(100),
+        cfg,
+        None,
+    )
+    assert out is None
+    assert called["unblocker"] is False
