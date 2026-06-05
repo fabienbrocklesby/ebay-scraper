@@ -39,6 +39,8 @@ description, image_urls (full gallery, full resolution), item_url, seller_id,
 store_url, category, item_specifics, mpn, upc, shipping, listing_type, niche,
 scraped_at`. Exactly what you need to import into Shopify.
 
+> **Heads up: the CSV is multi-currency.** Because stores span US/AU/UK, the `currency` column contains a mix of USD, AUD, and GBP. The prices are correct for each item's own marketplace. Do NOT map `price` straight into a single-currency Shopify store without first segmenting or converting by the `currency` column, or AUD/GBP prices will import as if they were USD.
+
 ---
 
 ## 2. Before you start: three things you need
@@ -161,10 +163,12 @@ scraper scrape status                  # workers show up; queued jobs fall as th
 
 ## 5. Daily use (all on the coordinator)
 
+> **Simplest path:** put your store URLs in a file and run `scraper run stores.txt`. It imports, scrapes, and writes split CSVs to `exports/` in one command, no niche tag required. The detailed commands below give more control (filtering by niche, running delta, etc.).
+
 ### Add stores (two ways, your choice)
 
 ```bash
-# one at a time
+# one at a time (--niche is required for store add; use scraper run if you don't need niche tagging)
 scraper store add https://www.ebay.com/str/STORENAME --niche tools
 
 # or bulk, from a text file (one store per line: "URL" or "URL,niche")

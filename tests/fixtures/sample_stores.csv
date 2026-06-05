@@ -1,0 +1,9 @@
+# Mixed US / AU / UK validation list. One eBay store URL per line.
+# AU (known-hard, must resolve to ebay.com.au via marketplace detection):
+https://www.ebay.com/str/goodpricepeople
+https://www.ebay.com/str/af2018
+# US (easy):
+https://www.ebay.com/str/onlinesound
+https://www.ebay.com/str/tool007tool
+# UK (placeholder - confirm a live .co.uk seller during the validation run):
+https://www.ebay.co.uk/str/redtiger_store

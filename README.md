@@ -64,6 +64,17 @@ Also required regardless of topology:
 
 ---
 
+## Quick start (operator)
+
+1. `scraper setup` — paste your proxy URL (and optional Oxylabs credentials). It tests them and saves them.
+2. `scraper doctor` — confirm everything is green (Redis, Postgres, Proxy, Workers).
+3. Put your eBay store URLs in a text file, one per line (any marketplace, no other info needed).
+4. `scraper run stores.txt` — scrapes everything and writes split CSV files to `exports/`.
+
+The scraper auto-detects each store's home marketplace (US / AU / UK). You do not tag stores with a location or a niche. Make sure at least one worker is running (on a VPS, or locally) before `scraper run`, or it will wait for one.
+
+---
+
 ## Table of contents
 
 - [Quick mental model](#quick-mental-model)
@@ -354,10 +365,12 @@ just use the coordinator setting and ignore this.
 
 All of these run on the **coordinator**.
 
+> **Simplest path:** if you just have a list of store URLs (any marketplace), use `scraper run stores.txt`. It imports, scrapes, and writes split CSVs to `exports/` in one command, no niche tagging required. The detailed flow below is for power users who want more control.
+
 ### Add stores to scrape
 
 ```bash
-# one at a time
+# one at a time (--niche is required here; use scraper run if you don't need niche tagging)
 scraper store add https://www.ebay.com/str/sellername --niche car-parts
 
 # or bulk, from a text file (one store per line: "URL" or "URL,niche")
@@ -483,6 +496,8 @@ scraper store remove https://www.ebay.com/str/hobbylinc
 ---
 
 ## CSV output
+
+> **Heads up: the CSV is multi-currency.** Because stores span US/AU/UK, the `currency` column contains a mix of USD, AUD, and GBP. The prices are correct for each item's own marketplace. Do NOT map `price` straight into a single-currency Shopify store without first segmenting or converting by the `currency` column, or AUD/GBP prices will import as if they were USD.
 
 Columns: `item_id, title, price, currency, condition, description, image_urls,
 item_url, seller_id, store_url, category, item_specifics, mpn, upc, shipping,

@@ -1,0 +1,2 @@
+# Allow CSV files in this directory (they are test fixtures, not output files).
+!*.csv
