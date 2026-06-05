@@ -178,3 +178,15 @@ def test_redact_url_masks_password():
     from scraper.cli import _redact_url
     assert _redact_url("postgresql://scraper:secret@host/db") == "postgresql://scraper:***@host/db"
     assert _redact_url("redis://host:6379") == "redis://host:6379"  # nothing to redact
+
+
+def test_wait_for_drain_aborts_without_workers(monkeypatch):
+    import types
+    import scraper.cli as cli
+    import click
+    import pytest
+    monkeypatch.setattr(cli, "queue_is_drained", lambda q: False)
+    monkeypatch.setattr(cli, "Worker", type("W", (), {"all": staticmethod(lambda queue=None: [])}))
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    with pytest.raises(click.ClickException):
+        cli._wait_for_drain(types.SimpleNamespace(count=0))

@@ -8,7 +8,7 @@ from psycopg2.extras import execute_values
 
 from scraper.config import Settings
 from scraper.fetch import ChallengeError, WrongCountryError, build_session, apply_proxy_country
-from scraper.queue import PROXY_REDIS_KEY
+from scraper.queue import PROXY_REDIS_KEY, resolve_proxy
 from scraper.scraper import scrape_item, parse_item_html, ProductData
 from scraper.store import extract_seller_id
 from scraper.throttle import TokenBucket, BoxProxyState
@@ -18,15 +18,11 @@ from scraper.unblocker import UnblockerConfig, fetch_via_unblocker, load_unblock
 def _get_proxy_url(settings: Settings) -> str | None:
     """Read proxy from Redis (coordinator-managed) with fallback to local config.
 
-    An empty-string Redis value means proxy was explicitly cleared by the coordinator.
+    Delegates to resolve_proxy so worker and coordinator share one definition.
     """
     import redis as redis_lib
     conn = redis_lib.from_url(settings.redis_url)
-    raw = conn.get(PROXY_REDIS_KEY)
-    if raw is not None:
-        val = raw.decode().strip()
-        return val if val else None
-    return settings.proxy_url
+    return resolve_proxy(conn, settings)
 
 
 _BULK_COLUMNS = (
@@ -157,6 +153,10 @@ def _scrape_one_with_unblocker(
     returns a standalone HTML snapshot with no live session cookies. The description
     field will be empty for these tail escalations, which is an acceptable tradeoff
     versus abandoning the item entirely.
+
+    The unblocker path also skips the wrong-country currency guard (proxy_url=None is
+    passed to parse_item_html). This is acceptable: Oxylabs Web Unlocker pins
+    geo_location to the target country, so the HTML it returns is already geo-correct.
     """
     try:
         return _scrape_one(item_url, residential_proxy, box_state, bucket)

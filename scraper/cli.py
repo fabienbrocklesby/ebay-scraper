@@ -7,7 +7,7 @@ import sys
 import time
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import asyncpg
 import click
@@ -15,13 +15,13 @@ from rq import Worker
 
 from scraper.config import Settings
 from scraper.db import (
-    add_store, clear_niche, get_counts, get_store_marketplace, init_schema,
+    add_store, clear_niche, get_counts, init_schema,
     list_stores, remove_store, set_store_marketplace,
 )
 from scraper.export import export_to_csv, export_split_csv
 from scraper.fetch import ChallengeError
 from scraper.marketplace import detect_marketplace
-from scraper.queue import enqueue_items, get_queue, get_redis, queue_is_drained, PROXY_REDIS_KEY
+from scraper.queue import enqueue_items, get_queue, get_redis, queue_is_drained, resolve_proxy, PROXY_REDIS_KEY
 from scraper.scraper import scrape_item
 from scraper.store import (
     _normalize_store_url, extract_seller_id, get_item_urls_from_store,
@@ -556,7 +556,13 @@ def _marketplace_seller_search(domain: str, seller_id: str) -> str:
     return f"https://{domain}/sch/i.html?_ssn={seller_id}"
 
 
-def _detect_and_resolve(seller_id, proxy_url, on_detected, unblocker_config, redis_conn):
+def _detect_and_resolve(
+    seller_id: str,
+    proxy_url: str | None,
+    on_detected: Callable[[str, str], None] | None,
+    unblocker_config: Any,
+    redis_conn: Any,
+) -> str | None:
     """Resolve a seller's home-marketplace seller-search URL, honestly.
 
     Trust a proxy detection only when every candidate answered conclusively (a result
@@ -591,8 +597,8 @@ def _discover_store(
     rps: float,
     cached: tuple[str, str] | None = None,
     on_detected: Callable[[str, str], None] | None = None,
-    unblocker_config=None,
-    redis_conn=None,
+    unblocker_config: Any = None,
+    redis_conn: Any = None,
 ) -> tuple[str, list[str]]:
     """Resolve a store's home marketplace, then crawl item URLs from that domain.
 
@@ -601,8 +607,9 @@ def _discover_store(
     confidence-gated (see _detect_and_resolve): a proxy result is adopted only when no
     candidate was left undetermined, else we escalate to an unblocker or leave the
     store unresolved rather than scrape a cross-listing in the wrong currency. Returns
-    (outcome, urls) with outcome in "ok", "empty", or "blocked": a crawl ChallengeError
-    is "blocked", a clean crawl with no items is "empty".
+    (outcome, urls) with outcome in "ok", "empty", "blocked", or "unresolved": a crawl
+    ChallengeError is "blocked", a clean crawl with no items is "empty", and a store
+    whose home marketplace could not be determined is "unresolved".
     """
     seller_id = extract_seller_id(store_url)
     if cached is not None:
@@ -610,7 +617,7 @@ def _discover_store(
     else:
         resolved = _detect_and_resolve(seller_id, proxy_url, on_detected, unblocker_config, redis_conn)
     if resolved is None:
-        return ("empty", [])
+        return ("unresolved", [])
     try:
         urls = get_item_urls_from_store(resolved, proxy_url=proxy_url, requests_per_second=rps)
     except ChallengeError:
@@ -659,7 +666,7 @@ def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
 
 
 def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, settings: "Settings"):
-    """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, total_queued)."""
+    """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, unresolved, total_queued)."""
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
     unblocker_config = load_unblocker_config(redis_conn)
@@ -667,6 +674,7 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
     ok: list[str] = []
     empty: list[tuple[str, str]] = []
     blocked: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, str]] = []
     total_queued = 0
     for store_url, niche in stores:
         click.echo(f"  Crawling {store_url} ...")
@@ -684,18 +692,27 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
         elif outcome == "empty":
             empty.append((store_url, niche))
             click.echo(f"    0 results (empty store, or this IP was served a degraded view)  [{niche}]")
+        elif outcome == "unresolved":
+            unresolved.append((store_url, niche))
+            click.echo(f"    home marketplace UNDETERMINED (proxy degraded, no unblocker)  [{niche}]")
         else:
             blocked.append((store_url, niche))
             click.echo(f"    BLOCKED by eBay  [{niche}]", err=True)
-    return ok, empty, blocked, total_queued
+    return ok, empty, blocked, unresolved, total_queued
 
 
-def _report_discovery(ok, empty, blocked, total_queued: int) -> None:
+def _report_discovery(ok, empty, blocked, unresolved, total_queued: int) -> None:
     click.echo(
         f"\nDone. {len(ok)} stores OK, {len(empty)} returned 0 results, "
-        f"{len(blocked)} blocked. {total_queued} item jobs queued for workers."
+        f"{len(blocked)} blocked, {len(unresolved)} unresolved. "
+        f"{total_queued} item jobs queued for workers."
     )
-    failures = empty + blocked
+    if unresolved:
+        click.echo(
+            f"\n{len(unresolved)} store(s): home marketplace UNDETERMINED "
+            f"(proxy degraded, no unblocker) - will retry"
+        )
+    failures = empty + blocked + unresolved
     if failures:
         _write_failed_stores(failures)
         click.echo(
@@ -733,13 +750,11 @@ def scrape_start(niche: str | None) -> None:
         return
 
     redis_conn = get_redis(settings.redis_url)
-    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
-    proxy_url = proxy_url or None
+    proxy_url = resolve_proxy(redis_conn, settings)
 
     stores = [(s["store_url"], s["niche"]) for s in rows]
-    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
-    _report_discovery(ok, empty, blocked, total_queued)
+    ok, empty, blocked, unresolved, total_queued = _run_discovery(stores, proxy_url, settings)
+    _report_discovery(ok, empty, blocked, unresolved, total_queued)
 
 
 @scrape.command("retry")
@@ -757,14 +772,12 @@ def scrape_retry() -> None:
     stores = _parse_store_lines(_FAILED_STORES_FILE.read_text(), None)
 
     redis_conn = get_redis(settings.redis_url)
-    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
-    proxy_url = proxy_url or None
+    proxy_url = resolve_proxy(redis_conn, settings)
 
-    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
-    _write_failed_stores(empty + blocked)
+    ok, empty, blocked, unresolved, total_queued = _run_discovery(stores, proxy_url, settings)
+    _write_failed_stores(empty + blocked + unresolved)
     click.echo(
-        f"\nRetry done. {len(ok)} recovered, {len(empty) + len(blocked)} still "
+        f"\nRetry done. {len(ok)} recovered, {len(empty) + len(blocked) + len(unresolved)} still "
         f"failing (kept in {_FAILED_STORES_FILE}). {total_queued} item jobs queued."
     )
 
@@ -782,9 +795,7 @@ def scrape_delta(niche: str | None) -> None:
     settings = Settings()
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
-    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
-    proxy_url = proxy_url or None
+    proxy_url = resolve_proxy(redis_conn, settings)
 
     async def _run() -> None:
         pool = await asyncpg.create_pool(settings.database_url)
@@ -924,8 +935,7 @@ def proxy_test(item_url: str) -> None:
     """Test the active proxy against a live eBay item page."""
     settings = Settings()
     redis_conn = get_redis(settings.redis_url)
-    raw = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw.decode().strip() if raw else settings.proxy_url
+    proxy_url = resolve_proxy(redis_conn, settings)
 
     if not proxy_url:
         click.echo("No proxy configured. Run 'scraper proxy set <url>' first.")
@@ -1031,13 +1041,35 @@ async def _import_stores(stores: list[tuple[str, str]]) -> None:
         await pool.close()
 
 
-async def _export_split_csv_all(export_dir: str, rows_per_file: int) -> list[str]:
+async def _export_split_csv_all(export_dir: str, rows_per_file: int) -> tuple[list[str], int]:
     settings = Settings()
     pool = await asyncpg.create_pool(settings.database_url)
     try:
-        return await export_split_csv(pool, export_dir, rows_per_file=rows_per_file, niche=None)
+        paths = await export_split_csv(pool, export_dir, rows_per_file=rows_per_file, niche=None)
+        # Mirror the exact filter used by export_split_csv / get_products_by_niche(None):
+        # no niche and no is_active filter, so this COUNT matches the CSV row count exactly.
+        total_rows = await pool.fetchval("SELECT COUNT(*) FROM products") or 0
+        return paths, int(total_rows)
     finally:
         await pool.close()
+
+
+def _wait_for_drain(queue) -> None:
+    """Block until the queue drains. Abort if no worker is connected across two
+    consecutive checks, so a missing/dead worker fails loudly instead of hanging forever."""
+    no_worker_strikes = 0
+    while not queue_is_drained(queue):
+        if not Worker.all(queue=queue):
+            no_worker_strikes += 1
+            if no_worker_strikes >= 2:
+                raise click.ClickException(
+                    "No workers connected; the queue cannot drain. Start a worker "
+                    "(scraper worker start) and re-run, or use --no-wait."
+                )
+        else:
+            no_worker_strikes = 0
+        time.sleep(10)
+        click.echo(f"  pending={queue.count} ...")
 
 
 @cli.command()
@@ -1055,12 +1087,10 @@ def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> 
     asyncio.run(_import_stores(stores))
 
     redis_conn = get_redis(settings.redis_url)
-    raw_proxy = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw_proxy.decode().strip() if raw_proxy else settings.proxy_url
-    proxy_url = proxy_url or None
+    proxy_url = resolve_proxy(redis_conn, settings)
 
-    ok, empty, blocked, total_queued = _run_discovery(stores, proxy_url, settings)
-    _report_discovery(ok, empty, blocked, total_queued)
+    ok, empty, blocked, unresolved, total_queued = _run_discovery(stores, proxy_url, settings)
+    _report_discovery(ok, empty, blocked, unresolved, total_queued)
 
     if no_wait:
         click.echo("Queued. Exiting without waiting (--no-wait).")
@@ -1073,15 +1103,16 @@ def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> 
             "Warning: no workers connected. Start a worker (scraper worker start) "
             "in another terminal/VPS, or this will wait indefinitely."
         )
-    while not queue_is_drained(queue):
-        time.sleep(10)
-        click.echo(f"  pending={queue.count} ...")
+    _wait_for_drain(queue)
 
-    paths = asyncio.run(_export_split_csv_all(export_dir, rows_per_file))
+    from rq.registry import FailedJobRegistry
+    paths, total_rows = asyncio.run(_export_split_csv_all(export_dir, rows_per_file))
     unblocker_used = int(redis_conn.get(UNBLOCKER_COUNT_KEY) or 0)
+    failed_jobs = FailedJobRegistry(queue=queue).count
     click.echo(
-        f"Done. {len(ok)}/{len(stores)} stores OK, {total_queued} items queued, "
-        f"{unblocker_used} unblocker requests, {len(paths)} CSV files in {export_dir}/"
+        f"Done. {len(ok)}/{len(stores)} stores OK, {total_rows} products exported, "
+        f"{failed_jobs} failed jobs, {unblocker_used} unblocker requests, "
+        f"{len(paths)} CSV files in {export_dir}/"
     )
 
 
@@ -1200,8 +1231,7 @@ def doctor() -> None:
     except Exception as exc:
         line("Postgres", False, str(exc))
 
-    raw = redis_conn.get(PROXY_REDIS_KEY)
-    proxy_url = raw.decode().strip() if raw else settings.proxy_url
+    proxy_url = resolve_proxy(redis_conn, settings)
     if proxy_url:
         line("Proxy", _probe_proxy_ok(proxy_url), "live eBay fetch")
     else:

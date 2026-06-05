@@ -24,6 +24,17 @@ def _item_id_from_url(item_url: str) -> str:
     return m.group(1)
 
 
+def resolve_proxy(redis_conn, settings) -> str | None:
+    """Resolve the active proxy URL. Redis is authoritative: a present value (even an
+    empty string, meaning 'explicitly cleared') overrides local config; only a missing
+    key falls back to settings.proxy_url."""
+    raw = redis_conn.get(PROXY_REDIS_KEY)
+    if raw is not None:
+        value = raw.decode().strip()
+        return value or None
+    return settings.proxy_url or None
+
+
 def get_redis(redis_url: str) -> redis_lib.Redis:
     return redis_lib.from_url(redis_url)
 

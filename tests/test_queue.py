@@ -2,6 +2,30 @@ from unittest.mock import MagicMock, patch
 from scraper.queue import enqueue_items, is_item_queued, mark_item_queued, queue_is_drained
 
 
+def test_resolve_proxy_honors_cleared_empty_string():
+    from scraper.queue import resolve_proxy
+    class R:
+        def get(self, k): return b""
+    class S: proxy_url = "http://local:1"
+    assert resolve_proxy(R(), S()) is None
+
+
+def test_resolve_proxy_falls_back_to_settings_when_key_missing():
+    from scraper.queue import resolve_proxy
+    class R:
+        def get(self, k): return None
+    class S: proxy_url = "http://local:1"
+    assert resolve_proxy(R(), S()) == "http://local:1"
+
+
+def test_resolve_proxy_prefers_redis_value():
+    from scraper.queue import resolve_proxy
+    class R:
+        def get(self, k): return b"http://redis:2"
+    class S: proxy_url = "http://local:1"
+    assert resolve_proxy(R(), S()) == "http://redis:2"
+
+
 def make_mock_redis(already_queued: set = None):
     r = MagicMock()
     already_queued = already_queued or set()
