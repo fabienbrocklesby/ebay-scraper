@@ -85,12 +85,14 @@ Placeholders used below (fill in your own values):
   big runs. Budget ~1 GB per ~7,000 items.
 - **Decodo / Smartproxy** (<https://decodo.com>): cheaper (~$2.2/GB), works about the
   same. Use country subdomains, e.g. `us.decodo.com:10001`. A drop-in alternative.
-- **Honest note (read section 10):** any rotating residential proxy reliably gets ~80%
-  of stores. A stubborn ~15-20% serve a fake "0 results" page to *all* residential
-  proxies; those are recovered by the coordinator's own IP + `scraper scrape retry`,
-  or, for hands-off near-100%, by an **unblocker API** (Bright Data Web Unlocker
-  ~$1.30/1,000 requests, or Oxylabs eBay Scraper API). Start with a plain residential
-  proxy; only add an unblocker if the re-run list stays too big.
+- **Honest note (read section 10):** stores span US/AU/UK marketplaces, and the scraper
+  auto-detects each store's home marketplace. This needs a residential proxy that can read
+  each country's eBay cleanly. A healthy proxy does this for free. If your proxy's IPs for
+  a country are reputation-flagged, you have two options: use a **fresh proxy account/pool**
+  (cheapest, try this first), or configure the optional **unblocker** (Oxylabs eBay Scraper
+  API, ~$1.30/1,000 requests) in `scraper setup`, which the scraper uses only for the cheap
+  one-time routing decision (~$6 across ~1,500 stores) while bulk scraping stays on the
+  proxy. Bright Data Web Unlocker is an equivalent alternative.
 
 **Tailscale:** free (<https://tailscale.com>), connects the coordinator and VPSs privately.
 
@@ -268,6 +270,15 @@ cd ebay-scraper            # or /root/ebay-scraper on a VPS
 git pull
 python3 -m pip install -e . --break-system-packages    # coordinator: drop the flag if not needed
 ```
+On the **coordinator**, after pulling, always run:
+```bash
+scraper db init            # idempotent: applies any new database columns a new version adds
+```
+This is required when upgrading an existing install. A new version may add columns to
+the database (the marketplace-detection columns, for example); `scraper db init` adds
+them safely and does nothing if they already exist. Skipping it causes a
+"column ... does not exist" error on the next run.
+
 On each VPS, also rebuild and restart the worker after pulling:
 ```bash
 scraper init <COORDINATOR_IP> --proxy "<PROXY_URL>"     # rebuilds + restarts the worker
@@ -297,18 +308,28 @@ scraper init <COORDINATOR_IP> --proxy "<PROXY_URL>"     # rebuilds + restarts th
 
 ## 10. Honest limits (so there are no surprises)
 
-- **About 15-20% of stores serve a fake "0 results" page to residential proxies.**
-  eBay detects proxy IPs and, for some stores, serves an empty storefront instead of
-  the real item grid, to every proxy IP, on every provider (tested IPRoyal and Decodo,
-  same result). It is not an empty store and not a bug. Those stores are recovered by:
-  (a) the **coordinator's own home/office IP**, which the scraper automatically falls
-  back to and which eBay serves the real grid; and (b) **`scraper scrape retry`**, which
-  re-runs the leftovers later on fresh IPs. The catch: a single IP gets throttled after
-  a few thousand fast requests, so for 1,000+ stores this is **iterative**, scrape, run
-  `scrape retry` a few times over the next day, and the list shrinks each pass. For
-  near-100% hands-off (no re-runs), use an **unblocker API** (Bright Data Web Unlocker
-  or Oxylabs eBay Scraper API), which defeats the anti-bot per request, that is the
-  paid upgrade if the manual re-run loop is too much.
+- **Stores on non-US marketplaces (the old "fake 0 results" stores).** What looked like
+  an anti-bot "fake empty" page turned out to be a **marketplace mismatch**: those sellers
+  live on a non-US eBay (e.g. Australian sellers on `ebay.com.au`), and eBay only serves a
+  seller's full item grid on their home domain to an in-country viewer. The scraper now
+  **auto-detects each store's home marketplace** (US/AU/UK) and routes to it with a
+  country-matched proxy IP, so you no longer tag stores with a location. You just drop a
+  plain URL list and run `scraper run`.
+  - Detection is **honest**: if it cannot confidently determine a seller's home (because
+    the proxy could not get a clean read on the other marketplaces), it does **not** guess
+    and risk scraping the wrong currency. It marks the store **UNRESOLVED** and saves it to
+    `~/.config/ebay-scraper/failed_stores.txt` for a later `scraper scrape retry`.
+  - Detection needs a clean read on each candidate marketplace. With a **healthy
+    residential proxy** this is free (the proxy itself reads each marketplace). If your
+    proxy's IPs for a given country are reputation-flagged (challenged by eBay), detection
+    for those falls back to the optional **unblocker** if you configured one in
+    `scraper setup` (Oxylabs); this costs only about 3 requests per store, one time
+    (~$6 across ~1,500 stores), and routing is then reliable regardless of proxy health.
+    Bulk item scraping still runs through the cheap proxy.
+  - **Practical tip:** if a lot of stores come back UNRESOLVED, your proxy account is
+    likely reputation-flagged for that country (often from heavy prior testing). Try a
+    **fresh proxy account / pool** first, that is the cheapest fix, before reaching for the
+    unblocker.
 - **Cost scales with proxy bandwidth on VPS workers.** Millions of items is doable
   but the proxy bill is real (section 7). The cheap-but-fiddly alternative is to run
   workers on residential-IP machines (no proxy needed), but eBay challenges a single
