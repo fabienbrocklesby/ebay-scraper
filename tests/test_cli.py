@@ -110,3 +110,10 @@ def test_probe_proxy_ok_is_callable(monkeypatch):
     from scraper import cli as climod
     monkeypatch.setattr(climod, "_probe_proxy_ok", lambda proxy_url: True, raising=False)
     assert climod._probe_proxy_ok("http://x") is True
+
+
+def test_doctor_command_registered():
+    from click.testing import CliRunner
+    from scraper.cli import cli
+    result = CliRunner().invoke(cli, ["doctor", "--help"])
+    assert result.exit_code == 0

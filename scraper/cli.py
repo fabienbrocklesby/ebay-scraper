@@ -1150,6 +1150,62 @@ def setup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+async def _ping_db() -> None:
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url)
+    try:
+        await pool.fetchval("SELECT 1")
+    finally:
+        await pool.close()
+
+
+@cli.command()
+def doctor() -> None:
+    """Check Redis, Postgres, proxy, unblocker, and connected workers."""
+    settings = Settings()
+
+    def line(label: str, ok: bool, detail: str = "") -> None:
+        mark = "OK " if ok else "XX "
+        click.echo(f"[{mark}] {label}{(' - ' + detail) if detail else ''}")
+
+    try:
+        redis_conn = get_redis(settings.redis_url)
+        redis_conn.ping()
+        line("Redis", True, settings.redis_url)
+    except Exception as exc:
+        line("Redis", False, str(exc))
+        return
+
+    try:
+        asyncio.run(_ping_db())
+        line("Postgres", True, settings.database_url)
+    except Exception as exc:
+        line("Postgres", False, str(exc))
+
+    raw = redis_conn.get(PROXY_REDIS_KEY)
+    proxy_url = raw.decode().strip() if raw else settings.proxy_url
+    if proxy_url:
+        line("Proxy", _probe_proxy_ok(proxy_url), "live eBay fetch")
+    else:
+        line("Proxy", False, "not configured (run `scraper setup`)")
+
+    cfg = load_unblocker_config(redis_conn)
+    if cfg.enabled:
+        used = int(redis_conn.get(UNBLOCKER_COUNT_KEY) or 0)
+        line("Unblocker", True, f"oxylabs configured, {used} requests used")
+    else:
+        line("Unblocker", True, "off (proxy-only) - this is fine")
+
+    queue = get_queue(redis_conn)
+    worker_count = len(Worker.all(queue=queue))
+    line("Workers", worker_count > 0, f"{worker_count} connected")
+
+
+# ---------------------------------------------------------------------------
 # db
 # ---------------------------------------------------------------------------
 
