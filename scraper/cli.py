@@ -1089,6 +1089,12 @@ def run(store_file: str, export_dir: str, rows_per_file: int, no_wait: bool) -> 
 # ---------------------------------------------------------------------------
 
 
+def _redact_url(url: str) -> str:
+    """Mask any embedded password in a URL before display (user:pass@host -> user:***@host)."""
+    import re
+    return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", url)
+
+
 def _probe_proxy_ok(proxy_url: str) -> bool:
     """Fetch a real eBay store page through the proxy; return True only if no challenge page.
 
@@ -1107,13 +1113,20 @@ def _probe_proxy_ok(proxy_url: str) -> bool:
 
 
 def _probe_unblocker_ok(username: str, password: str) -> bool:
-    """Fetch a real eBay page via the Oxylabs unblocker; return True if HTML is returned."""
+    """Fetch a real eBay page via the Oxylabs unblocker; return True if HTML is returned.
+
+    The broad except is intentional: any failure means the unblocker is not usable, and
+    the wizard must report a clean failure rather than crash.
+    """
     from scraper.unblocker import UnblockerConfig, fetch_via_unblocker
-    cfg = UnblockerConfig(provider="oxylabs", username=username, password=password)
-    html = fetch_via_unblocker(
-        "https://www.ebay.com/sch/i.html?_ssn=onlinesound&_pgn=1&_ipg=60", cfg
-    )
-    return bool(html)
+    try:
+        cfg = UnblockerConfig(provider="oxylabs", username=username, password=password)
+        html = fetch_via_unblocker(
+            "https://www.ebay.com/sch/i.html?_ssn=onlinesound&_pgn=1&_ipg=60", cfg
+        )
+        return bool(html)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @cli.command()
@@ -1175,14 +1188,14 @@ def doctor() -> None:
     try:
         redis_conn = get_redis(settings.redis_url)
         redis_conn.ping()
-        line("Redis", True, settings.redis_url)
+        line("Redis", True, _redact_url(settings.redis_url))
     except Exception as exc:
         line("Redis", False, str(exc))
         return
 
     try:
         asyncio.run(_ping_db())
-        line("Postgres", True, settings.database_url)
+        line("Postgres", True, _redact_url(settings.database_url))
     except Exception as exc:
         line("Postgres", False, str(exc))
 

@@ -117,3 +117,9 @@ def test_doctor_command_registered():
     from scraper.cli import cli
     result = CliRunner().invoke(cli, ["doctor", "--help"])
     assert result.exit_code == 0
+
+
+def test_redact_url_masks_password():
+    from scraper.cli import _redact_url
+    assert _redact_url("postgresql://scraper:secret@host/db") == "postgresql://scraper:***@host/db"
+    assert _redact_url("redis://host:6379") == "redis://host:6379"  # nothing to redact
