@@ -131,7 +131,7 @@ def test_discover_store_cached_skips_detection(monkeypatch):
     monkeypatch.setattr(c, "detect_marketplace",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not detect")))
     monkeypatch.setattr(c, "get_item_urls_from_store",
-                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999: [])
+                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999, max_challenge_retries=4: [])
     assert c._discover_store(
         "https://www.ebay.com/str/aussie", "http://proxy", 0.5, cached=("www.ebay.com.au", "au")
     ) == ("empty", [])
@@ -140,7 +140,7 @@ def test_discover_store_cached_skips_detection(monkeypatch):
 def test_discover_store_empty_trusts_clean_zero(monkeypatch):
     import scraper.cli as c
     monkeypatch.setattr(c, "get_item_urls_from_store",
-                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999: [])
+                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999, max_challenge_retries=4: [])
     # cached marketplace skips detection; a clean crawl with no items is a genuinely empty store
     assert c._discover_store(
         "https://www.ebay.com/str/x", "http://proxy", 0.5, cached=("www.ebay.com", "us")
@@ -151,7 +151,7 @@ def test_discover_store_blocked_on_crawl_challenge(monkeypatch):
     import scraper.cli as c
     from scraper.fetch import ChallengeError
 
-    def fake(url, proxy_url=None, requests_per_second=0.5, max_pages=9999):
+    def fake(url, proxy_url=None, requests_per_second=0.5, max_pages=9999, max_challenge_retries=4):
         raise ChallengeError("blocked")
 
     monkeypatch.setattr(c, "get_item_urls_from_store", fake)
@@ -275,7 +275,7 @@ def test_run_discovery_us_only_pins_com_and_skips_detection(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("detection must be skipped in us_only")))
     seen = {}
 
-    def fake_get_urls(url, proxy_url=None, requests_per_second=0.5, max_pages=9999):
+    def fake_get_urls(url, proxy_url=None, requests_per_second=0.5, max_pages=9999, max_challenge_retries=4):
         seen["url"] = url
         return ["https://www.ebay.com/itm/111111111111"]
 

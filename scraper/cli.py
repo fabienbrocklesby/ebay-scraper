@@ -609,6 +609,7 @@ def _discover_store(
     unblocker_config: Any = None,
     redis_conn: Any = None,
     max_pages: int = 9999,
+    max_challenge_retries: int = 4,
 ) -> tuple[str, list[str]]:
     """Resolve a store's home marketplace, then crawl item URLs from that domain.
 
@@ -630,7 +631,8 @@ def _discover_store(
         return ("unresolved", [])
     try:
         urls = get_item_urls_from_store(
-            resolved, proxy_url=proxy_url, requests_per_second=rps, max_pages=max_pages
+            resolved, proxy_url=proxy_url, requests_per_second=rps, max_pages=max_pages,
+            max_challenge_retries=max_challenge_retries,
         )
     except ChallengeError:
         # The cheap proxy is challenged on this seller's search surface (US/UK on a
@@ -721,14 +723,26 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
     for i, (store_url, niche) in enumerate(stores):
         click.echo(f"  Crawling {store_url} ...")
         cached = ("www.ebay.com", "us") if us_only else cached_map.get(store_url)
-        discovery_proxy = pool[i % len(pool)] if pool else proxy_url
-        outcome, item_urls = _discover_store(
-            store_url, discovery_proxy, settings.requests_per_second,
-            cached=cached,
-            on_detected=lambda d, c, _u=store_url: _persist(_u, d, c),
-            unblocker_config=unblocker_config, redis_conn=redis_conn,
-            max_pages=max_pages,
-        )
+        on_detected = lambda d, c, _u=store_url: _persist(_u, d, c)
+        if pool:
+            # Try the store across pool IPs (rotated start), failing fast per IP, so a
+            # single flagged IP no longer blocks a store that another IP can crawl.
+            outcome, item_urls = ("blocked", [])
+            for k in range(len(pool)):
+                proxy = pool[(i + k) % len(pool)]
+                outcome, item_urls = _discover_store(
+                    store_url, proxy, settings.requests_per_second, cached=cached,
+                    on_detected=on_detected, unblocker_config=unblocker_config,
+                    redis_conn=redis_conn, max_pages=max_pages, max_challenge_retries=1,
+                )
+                if outcome != "blocked":
+                    break
+        else:
+            outcome, item_urls = _discover_store(
+                store_url, proxy_url, settings.requests_per_second, cached=cached,
+                on_detected=on_detected, unblocker_config=unblocker_config,
+                redis_conn=redis_conn, max_pages=max_pages,
+            )
         if outcome == "ok":
             queued = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
             total_queued += queued
