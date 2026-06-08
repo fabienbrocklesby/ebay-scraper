@@ -391,12 +391,73 @@ store URL. The `--niche` tag groups items so you can export them separately late
 ```bash
 scraper scrape start                 # crawl all registered stores
 scraper scrape start --niche car-parts   # only that niche
+# Recommended for a US ISP pool (see docs/STRATEGY.md):
+scraper scrape start --us-only --cap-per-store 5000
 ```
 
 This crawls each store's pages on the coordinator, finds every item, and queues
 the items as jobs in batches. The workers scrape them. If eBay blocks a store
-mid-crawl, the command says so clearly and tells you which stores to re-run after
-the proxy cools down (it does not silently return a partial list).
+mid-crawl, the command says so clearly and saves it for `scraper scrape retry`
+(it does not silently return a partial list).
+
+- `--us-only` pins every store to ebay.com and skips marketplace detection. Use it
+  with a US ISP pool: non-US sellers can't be fetched anyway, so this stops them
+  burning proxy reputation on doomed wrong-country fetches.
+- `--cap-per-store N` stops discovery after ~N items per store and skips the slow
+  price-partition crawl, so a first full pass finishes sooner. eBay only surfaces
+  ~10,000 items per store regardless.
+
+```bash
+scraper scrape retry --us-only --cap-per-store 5000   # re-run only the blocked stores
+```
+
+> **Read `docs/STRATEGY.md` before changing proxy behaviour.** It records the
+> settled facts (discovery vs item-fetch surfaces, what burns IPs, eBay's per-store
+> cap, the IP-count throughput math) so we stop re-deriving them.
+
+### Live progress (`scrape monitor`)
+
+```bash
+scraper scrape monitor
+```
+
+A live dashboard: a progress bar, current rate, projected items/day, ETA and ISP
+pool size locked at the top, with a feed of items as they are scraped below.
+Ctrl-C exits the dashboard; scraping keeps running in the background. For a plain
+one-shot snapshot (e.g. in a script) use `scraper scrape status`.
+
+### Scale by adding ISP IPs (live, no restart)
+
+Throughput is linear in ISP-IP count (~1 item/sec/IP ≈ ~86k/day/IP, so ~12-15 IPs
+for ~1M/day). Add IPs any time, even mid-run, and the next batch starts using them
+with no lost progress:
+
+```bash
+scraper proxy pool add 1.2.3.4:12323:user:pass   # accepts IPRoyal host:port:user:pass
+scraper proxy pool list
+scraper proxy pool test                          # fetch one item through each IP
+scraper proxy pool remove 1.2.3.4:12323:user:pass
+```
+
+Discovery uses the rotating residential proxy set with `scraper proxy set`; item
+fetching is spread across this ISP pool. Do not put discovery on the ISP pool
+(`--discover-via-pool` is an emergency-only flag - it wears the pool).
+
+### Auto-resume (systemd, recommended on the VPS)
+
+Run the worker and the discovery loop as services so scraping survives reboots,
+crashes, and automatically resumes once burned proxies cool:
+
+```bash
+sudo cp deploy/ebay-worker.service deploy/ebay-discovery.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ebay-worker ebay-discovery
+journalctl -u ebay-discovery -f      # watch discovery
+journalctl -u ebay-worker -f         # watch fetching
+```
+
+The discovery service does one full pass then re-attempts blocked stores every 30
+minutes (as residential exit IPs cool, more succeed each pass).
 
 ### Keep it fresh cheaply (delta)
 

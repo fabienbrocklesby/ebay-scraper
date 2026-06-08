@@ -108,6 +108,15 @@ async def get_counts(pool: asyncpg.Pool) -> dict[str, int]:
     return {row["niche"]: int(row["count"]) for row in rows}
 
 
+async def get_recent_products(pool: asyncpg.Pool, limit: int = 15) -> list[asyncpg.Record]:
+    """Most recently scraped products, newest first, for the live monitor feed."""
+    return await pool.fetch(
+        "SELECT item_id, title, price, currency, store_url, last_seen_at "
+        "FROM products ORDER BY last_seen_at DESC LIMIT $1",
+        limit,
+    )
+
+
 async def clear_niche(pool: asyncpg.Pool, niche: str) -> None:
     await pool.execute("DELETE FROM products WHERE niche = $1", niche)
 

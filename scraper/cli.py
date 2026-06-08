@@ -15,7 +15,7 @@ from rq import Worker
 
 from scraper.config import Settings
 from scraper.db import (
-    add_store, clear_niche, get_counts, init_schema,
+    add_store, clear_niche, get_counts, get_recent_products, init_schema,
     list_stores, remove_store, set_store_marketplace,
 )
 from scraper.export import export_to_csv, export_split_csv
@@ -985,6 +985,115 @@ def scrape_status(show_stores: bool) -> None:
         click.echo(f"\nRegistered stores ({len(stores)}):")
         for s in stores:
             click.echo(f"  {s['store_url']}  [{s['niche']}]")
+
+
+def _fmt_eta(seconds: float | None) -> str:
+    if not seconds or seconds <= 0:
+        return "--"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _text_bar(pct: float, width: int = 40) -> str:
+    filled = int(round(pct / 100 * width))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {pct:5.1f}%"
+
+
+@scrape.command("monitor")
+@click.option("--interval", default=2.0, show_default=True,
+              help="Seconds between refreshes.")
+def scrape_monitor(interval: float) -> None:
+    """Live dashboard: progress bar, rate, ETA and pool size locked at the top, with a
+    feed of items as they are scraped below. Ctrl-C to exit (scraping keeps running).
+    """
+    from collections import deque
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rq.registry import StartedJobRegistry, DeferredJobRegistry
+
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    queue = get_queue(redis_conn)
+    history: deque[tuple[float, int]] = deque(maxlen=60)
+
+    async def _snapshot() -> tuple[int, list]:
+        pool = await asyncpg.create_pool(settings.database_url)
+        try:
+            counts = await get_counts(pool)
+            recent = await get_recent_products(pool, 16)
+            return sum(counts.values()), recent
+        finally:
+            await pool.close()
+
+    def _render():
+        scraped, recent = asyncio.run(_snapshot())
+        discovered = int(redis_conn.scard(SCRAPED_SET_KEY) or 0)
+        pool_size = len(resolve_isp_pool(redis_conn))
+        pending, inflight, retrying = (
+            len(queue), StartedJobRegistry(queue=queue).count,
+            DeferredJobRegistry(queue=queue).count,
+        )
+        now = time.time()
+        history.append((now, scraped))
+        rate_min = 0.0
+        if len(history) >= 2 and history[-1][0] > history[0][0]:
+            rate_min = (history[-1][1] - history[0][1]) / (history[-1][0] - history[0][0]) * 60
+        remaining = max(discovered - scraped, 0)
+        pct = (scraped / discovered * 100) if discovered else 0.0
+        eta = (remaining / (rate_min / 60)) if rate_min > 0 else None
+        per_day = int(rate_min * 60 * 24)
+
+        head = Table.grid(expand=True)
+        head.add_column(justify="left")
+        head.add_column(justify="right")
+        head.add_row(
+            Text(f"Scraped {scraped:,} / {discovered:,} discovered", style="bold cyan"),
+            Text(f"ISP pool: {pool_size} IP(s)", style="bold"),
+        )
+        head.add_row(Text(_text_bar(pct), style="green"), Text(""))
+        head.add_row(
+            Text(f"Remaining: {remaining:,}    Rate: {rate_min:,.0f}/min "
+                 f"(~{per_day:,}/day)    ETA: {_fmt_eta(eta)}", style="yellow"),
+            Text(f"queue {pending} | active {inflight} | retry {retrying}", style="dim"),
+        )
+        header = Panel(head, title="eBay Scraper - live", border_style="cyan")
+
+        feed = Table(expand=True, show_edge=False, pad_edge=False)
+        feed.add_column("item", style="dim", width=14)
+        feed.add_column("title", ratio=3, no_wrap=True)
+        feed.add_column("price", justify="right", width=12)
+        feed.add_column("store", ratio=1, no_wrap=True)
+        for r in recent:
+            store = r["store_url"].rsplit("/", 1)[-1] if r["store_url"] else ""
+            price = f"{r['price']:.2f} {r['currency'] or ''}".strip() if r["price"] is not None else "-"
+            feed.add_row(
+                str(r["item_id"]), (r["title"] or "")[:70], price, store[:24],
+            )
+        body = Panel(feed, title="latest scraped", border_style="green")
+        return Group(header, body)
+
+    console = Console()
+    if not discovered_hint(redis_conn):
+        console.print("[dim]Waiting for the crawl to discover and scrape items...[/dim]")
+    try:
+        with Live(_render(), console=console, screen=True, refresh_per_second=4) as live:
+            while True:
+                time.sleep(interval)
+                live.update(_render())
+    except KeyboardInterrupt:
+        console.print("Monitor closed. Scraping continues in the background.")
+
+
+def discovered_hint(redis_conn) -> bool:
+    return int(redis_conn.scard(SCRAPED_SET_KEY) or 0) > 0
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,19 @@
+# deploy/ebay-discovery.service
+# Runs the discovery loop on the coordinator: one full pass, then retry blocked
+# stores every 30 min as the residential pool cools. Restart=always so it resumes
+# automatically after a crash or reboot.
+[Unit]
+Description=eBay scraper discovery loop (feeds the work queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/.config/ebay-scraper/.env
+ExecStart=/bin/bash /root/ebay-scraper/deploy/discovery-loop.sh
+Restart=always
+RestartSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target
