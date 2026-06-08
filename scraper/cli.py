@@ -834,12 +834,19 @@ def scrape_start(niche: str | None, us_only: bool, cap_per_store: int,
 
 
 @scrape.command("retry")
-def scrape_retry() -> None:
+@click.option("--us-only", is_flag=True, default=False,
+              help="Pin every store to ebay.com (US) and skip marketplace detection.")
+@click.option("--cap-per-store", type=int, default=0, show_default=True,
+              help="Stop discovery after roughly this many items per store (0 = no cap).")
+@click.option("--discover-via-pool", is_flag=True, default=False,
+              help="Route store pagination through the ISP pool instead of residential.")
+def scrape_retry(us_only: bool, cap_per_store: int, discover_via_pool: bool) -> None:
     """Re-run discovery for stores that returned 0 results or were blocked last time.
 
     Reads the failure list written by 'scrape start' and tries each store again
     (fresh IPs at a different time recover most of them). Stores that succeed are
-    queued and dropped from the list; the rest stay for the next retry.
+    queued and dropped from the list; the rest stay for the next retry. Pass the same
+    flags you used for 'scrape start' so retries crawl the same way.
     """
     settings = Settings()
     if not _FAILED_STORES_FILE.exists() or not _FAILED_STORES_FILE.read_text().strip():
@@ -850,7 +857,11 @@ def scrape_retry() -> None:
     redis_conn = get_redis(settings.redis_url)
     proxy_url = resolve_proxy(redis_conn, settings)
 
-    ok, empty, blocked, unresolved, total_queued = _run_discovery(stores, proxy_url, settings)
+    max_pages = max(1, cap_per_store // 240) if cap_per_store > 0 else 9999
+    ok, empty, blocked, unresolved, total_queued = _run_discovery(
+        stores, proxy_url, settings, us_only=us_only, max_pages=max_pages,
+        discover_via_pool=discover_via_pool,
+    )
     _write_failed_stores(empty + blocked + unresolved)
     click.echo(
         f"\nRetry done. {len(ok)} recovered, {len(empty) + len(blocked) + len(unresolved)} still "
