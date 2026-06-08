@@ -689,7 +689,8 @@ def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
 
 
 def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, settings: "Settings",
-                   us_only: bool = False, max_pages: int = 9999):
+                   us_only: bool = False, max_pages: int = 9999,
+                   discover_via_pool: bool = False):
     """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, unresolved, total_queued).
 
     us_only pins every store to ebay.com (US) and skips home-marketplace detection.
@@ -697,21 +698,32 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
     detecting and queuing them would only burn proxy reputation on doomed
     wrong-country fetches; pinning US makes those sellers return empty at discovery
     and never enter the queue. It also avoids the per-store multi-domain probes.
+
+    discover_via_pool routes store pagination through the static ISP pool (a fresh
+    pool IP per store, round-robin) instead of the rotating residential proxy. Use it
+    when the residential proxy is degraded: the clean ISP IPs paginate reliably where
+    a flagged residential pool returns nothing.
     """
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
     unblocker_config = load_unblocker_config(redis_conn)
+    pool = resolve_isp_pool(redis_conn) if discover_via_pool else []
+    if discover_via_pool and not pool:
+        raise click.ClickException(
+            "--discover-via-pool needs a non-empty ISP pool (scraper proxy pool add <ip>)."
+        )
     cached_map = asyncio.run(_load_cached_marketplaces([s[0] for s in stores]))
     ok: list[str] = []
     empty: list[tuple[str, str]] = []
     blocked: list[tuple[str, str]] = []
     unresolved: list[tuple[str, str]] = []
     total_queued = 0
-    for store_url, niche in stores:
+    for i, (store_url, niche) in enumerate(stores):
         click.echo(f"  Crawling {store_url} ...")
         cached = ("www.ebay.com", "us") if us_only else cached_map.get(store_url)
+        discovery_proxy = pool[i % len(pool)] if pool else proxy_url
         outcome, item_urls = _discover_store(
-            store_url, proxy_url, settings.requests_per_second,
+            store_url, discovery_proxy, settings.requests_per_second,
             cached=cached,
             on_detected=lambda d, c, _u=store_url: _persist(_u, d, c),
             unblocker_config=unblocker_config, redis_conn=redis_conn,
@@ -766,7 +778,12 @@ def _report_discovery(ok, empty, blocked, unresolved, total_queued: int) -> None
               help="Stop discovery after roughly this many items per store (0 = no cap). "
                    "Caps depth on giant stores and skips the slow price-partition crawl, "
                    "so a first full pass finishes sooner. eBay surfaces ~10000/store max.")
-def scrape_start(niche: str | None, us_only: bool, cap_per_store: int) -> None:
+@click.option("--discover-via-pool", is_flag=True, default=False,
+              help="Route store pagination through the ISP pool (a fresh pool IP per "
+                   "store) instead of the rotating residential proxy. Use when the "
+                   "residential proxy is degraded and returning challenges.")
+def scrape_start(niche: str | None, us_only: bool, cap_per_store: int,
+                 discover_via_pool: bool) -> None:
     """Paginate all registered stores and queue item scrape jobs for VPS workers.
 
     Store pagination runs here on the coordinator through the rotating proxy. Every
@@ -796,7 +813,8 @@ def scrape_start(niche: str | None, us_only: bool, cap_per_store: int) -> None:
     # eBay lists 240 items per page; max_pages bounds the per-store crawl to ~cap items.
     max_pages = max(1, cap_per_store // 240) if cap_per_store > 0 else 9999
     ok, empty, blocked, unresolved, total_queued = _run_discovery(
-        stores, proxy_url, settings, us_only=us_only, max_pages=max_pages
+        stores, proxy_url, settings, us_only=us_only, max_pages=max_pages,
+        discover_via_pool=discover_via_pool,
     )
     _report_discovery(ok, empty, blocked, unresolved, total_queued)
 
