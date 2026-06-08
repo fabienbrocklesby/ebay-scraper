@@ -27,6 +27,11 @@ _PAGES_PER_SESSION = max(1, int(os.getenv("PAGES_PER_SESSION", "10")))
 # as the genuine end of the store.
 _EMPTY_PAGE_RETRIES = 2
 
+# Every discovery HTTP call must have an explicit timeout: without one a stalled
+# proxy connection blocks the whole crawl indefinitely (one hung residential exit
+# IP would wedge the entire run).
+_FETCH_TIMEOUT = 30
+
 
 def extract_seller_id(store_url: str) -> str:
     path = urlparse(store_url).path.strip("/")
@@ -93,7 +98,7 @@ def _has_next_page(html: str) -> bool:
 
 def _warmup(client: Any, homepage: str, delay: float) -> None:
     try:
-        client.get(homepage)
+        client.get(homepage, timeout=_FETCH_TIMEOUT)
     except Exception:
         pass
     time.sleep(max(0.5, delay))
@@ -104,7 +109,7 @@ def _fetch_listing_page(
 ) -> str | None:
     """Fetch one store listing page. Returns HTML, or None on transport error / non-200."""
     try:
-        response = client.get(page_url, headers={"Referer": homepage})
+        response = client.get(page_url, headers={"Referer": homepage}, timeout=_FETCH_TIMEOUT)
     except Exception:
         return None
     if response.status_code != 200:
