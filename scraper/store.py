@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from typing import Any, Callable
@@ -11,12 +12,13 @@ from scraper.fetch import ChallengeError, apply_proxy_country, build_session, is
 # slows how quickly a single IP trips eBay's per-IP request throttle.
 _ITEMS_PER_PAGE = 240
 
-# eBay challenges a single IP after roughly 20-40 requests. With a rotating
-# residential proxy a fresh session yields a fresh exit IP, so the crawl rebuilds
-# its session every few pages to stay well under that threshold and keep going on
-# large stores. Without a proxy (direct from the coordinator IP) rotating gains
-# nothing, so it is skipped.
-_PAGES_PER_SESSION = 10
+# eBay challenges a single IP after roughly 20-40 requests on the listing surface.
+# With a rotating residential proxy a fresh session yields a fresh exit IP, so the
+# crawl rebuilds its session every few pages to stay under that threshold. When the
+# residential pool is partly flagged, set PAGES_PER_SESSION=1 so every page draws a
+# fresh IP, which sidesteps the flagged ones. Without a proxy (direct from the
+# coordinator IP) rotating gains nothing, so it is skipped.
+_PAGES_PER_SESSION = max(1, int(os.getenv("PAGES_PER_SESSION", "10")))
 
 # eBay intermittently serves a short/empty listing page mid-crawl (observed: a
 # ~130KB page with 0 items wedged between two full pages). Treating that as the
