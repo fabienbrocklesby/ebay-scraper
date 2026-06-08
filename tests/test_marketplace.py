@@ -65,6 +65,49 @@ def test_persistent_challenge_is_undetermined():
     assert set(outcome.undetermined_domains) == {d for d, _ in CANDIDATE_MARKETPLACES}
 
 
+def test_probes_storefront_not_seller_search():
+    seen = []
+
+    def fetch_fn(url, proxy_url):
+        seen.append(url)
+        return _grid_html(10) if "ebay.com.au" in url else _grid_html(0)
+
+    outcome = detect_marketplace("mystore", proxy_url=None, fetch_fn=fetch_fn)
+    assert seen, "detection should probe at least one domain"
+    assert all("/str/mystore" in u for u in seen)
+    assert all("/sch/" not in u for u in seen)
+    assert outcome.result.seller_search_url.startswith("https://www.ebay.com.au/str/mystore")
+
+
+def test_cross_listing_tie_breaks_to_priority_domain():
+    # Cross-border listings cap at a full page on several domains, so a tie is normal.
+    # It must break toward the earlier (higher-priority) candidate, not be abandoned.
+    def fetch_fn(url, proxy_url):
+        if "ebay.de" in url:
+            return _grid_html(200)
+        if "ebay.com.au" in url:
+            return _grid_html(200)
+        return _grid_html(2)
+
+    outcome = detect_marketplace("tie", proxy_url=None, fetch_fn=fetch_fn)
+    assert outcome.result is not None
+    assert outcome.result.country == "au"  # .com.au precedes .de in candidate order
+
+
+def test_clear_winner_with_small_cross_listings_still_resolves():
+    # A handful of cross-listings on another domain must not block a confident home.
+    def fetch_fn(url, proxy_url):
+        if "ebay.com.au" in url:
+            return _grid_html(200)
+        if "ebay.com" in url and "com.au" not in url:
+            return _grid_html(8)
+        return _grid_html(0)
+
+    outcome = detect_marketplace("clearau", proxy_url=None, fetch_fn=fetch_fn)
+    assert outcome.result is not None
+    assert outcome.result.country == "au"
+
+
 def test_challenge_page_html_is_retried_not_counted_as_zero():
     calls = {"n": 0}
 

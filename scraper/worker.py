@@ -8,7 +8,7 @@ from psycopg2.extras import execute_values
 
 from scraper.config import Settings
 from scraper.fetch import ChallengeError, WrongCountryError, build_session, apply_proxy_country
-from scraper.queue import PROXY_REDIS_KEY, resolve_proxy
+from scraper.queue import PROXY_REDIS_KEY, resolve_proxy, resolve_isp_pool
 from scraper.scraper import scrape_item, parse_item_html, ProductData
 from scraper.store import extract_seller_id
 from scraper.throttle import TokenBucket, BoxProxyState
@@ -172,25 +172,68 @@ def _scrape_one_with_unblocker(
 _MAX_BATCH_ATTEMPTS = 3
 
 
-def scrape_batch(item_urls: list[str], niche: str, store_url: str, attempt: int = 0) -> None:
-    """rq job: fetch a batch of item URLs concurrently and bulk-upsert the results.
+def _pool_fetch_one(item_url: str, proxy_url: str) -> Optional[ProductData]:
+    """Fetch one item directly through an assigned static ISP proxy IP.
 
-    Failed items are collected and re-enqueued as a smaller batch, up to
-    _MAX_BATCH_ATTEMPTS total attempts, so a few bad items never fail the whole
-    batch and never loop forever.
+    Unlike _scrape_one there is no box-IP-first attempt: the box (a datacenter VPS,
+    or the coordinator's own flagged IP) is blocked by eBay, so going straight to a
+    reputable ISP IP avoids a wasted blocked request per item. A warmed, reused
+    per-thread session carries cookies so eBay does not 403 a cold session. A
+    challenge or wrong-country result raises so the batch requeues the item (a later
+    attempt lands on a different pool IP via round-robin)."""
+    session = _warmed_session(proxy_url, item_url)
+    return scrape_item(item_url, proxy_url=proxy_url, client=session)
 
-    eBay's item JSON-LD often omits the seller, but an item in a store belongs
-    to that store's seller, so seller_id is derived from the store URL when missing.
-    """
-    settings = Settings()
+
+def _run_pool_fetch(
+    item_urls: list[str],
+    pool: list[str],
+    max_rps_per_ip: float,
+    concurrency: int,
+    fetch_one,
+) -> tuple[list[ProductData], list[str]]:
+    """Fetch items concurrently, spreading them across the static ISP pool.
+
+    Each pool IP gets its own TokenBucket, so every IP is independently capped at
+    max_rps_per_ip and total throughput scales with pool size. URLs are assigned
+    round-robin, and concurrency is capped at the pool size so the pool is never
+    asked to run more in-flight requests than it has IPs. A None result (genuine
+    404 / unparseable page) is not a failure; any raised exception is. Returns
+    (results, failed)."""
+    buckets = {p: TokenBucket(max_rps_per_ip) for p in pool}
+    assignments = [(url, pool[i % len(pool)]) for i, url in enumerate(item_urls)]
+    workers = min(concurrency, len(pool)) or 1
+
+    def _guarded(url: str, proxy: str) -> Optional[ProductData]:
+        buckets[proxy].acquire()
+        return fetch_one(url, proxy)
+
+    results: list[ProductData] = []
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_guarded, url, proxy): url for url, proxy in assignments}
+        for fut in as_completed(futures):
+            url = futures[fut]
+            try:
+                data = fut.result()
+                if data is not None:
+                    results.append(data)
+            except Exception:
+                failed.append(url)
+    return results, failed
+
+
+def _legacy_box_fetch(
+    item_urls: list[str], settings: Settings, redis_conn: Any
+) -> tuple[list[ProductData], list[str]]:
+    """Original box-IP-first path: fetch on the box's own IP, escalate to the
+    residential proxy (and then the unblocker) on a challenge. Used when no ISP
+    pool is configured, preserving the multi-box residential-IP topology."""
     residential = _get_proxy_url(settings)
     bucket = TokenBucket(settings.max_rps_per_ip)
     box_state = BoxProxyState(
         settings.challenge_escalation_threshold, settings.challenge_cooldown_seconds
     )
-
-    from scraper.queue import get_redis
-    redis_conn = get_redis(settings.redis_url)
     unblocker_config = load_unblocker_config(redis_conn)
 
     results: list[ProductData] = []
@@ -205,14 +248,43 @@ def scrape_batch(item_urls: list[str], niche: str, store_url: str, attempt: int 
             try:
                 data = fut.result()
                 if data is not None:
-                    if not data.seller_id:
-                        try:
-                            data.seller_id = extract_seller_id(store_url)
-                        except ValueError:
-                            pass
                     results.append(data)
             except Exception:
                 failed.append(url)
+    return results, failed
+
+
+def scrape_batch(item_urls: list[str], niche: str, store_url: str, attempt: int = 0) -> None:
+    """rq job: fetch a batch of item URLs concurrently and bulk-upsert the results.
+
+    When a static ISP pool is configured (the cheap flat-rate topology), item
+    fetches are spread across the pool, one IP per request, each IP independently
+    rate-limited. Otherwise the original box-IP-first path is used. Failed items are
+    re-enqueued as a smaller batch up to _MAX_BATCH_ATTEMPTS, so a few bad items
+    never fail the whole batch and never loop forever.
+
+    eBay's item JSON-LD often omits the seller, but an item in a store belongs to
+    that store's seller, so seller_id is derived from the store URL when missing.
+    """
+    settings = Settings()
+    from scraper.queue import get_redis
+    redis_conn = get_redis(settings.redis_url)
+    isp_pool = resolve_isp_pool(redis_conn)
+
+    if isp_pool:
+        results, failed = _run_pool_fetch(
+            item_urls, isp_pool, settings.max_rps_per_ip,
+            settings.worker_concurrency, _pool_fetch_one,
+        )
+    else:
+        results, failed = _legacy_box_fetch(item_urls, settings, redis_conn)
+
+    for data in results:
+        if not data.seller_id:
+            try:
+                data.seller_id = extract_seller_id(store_url)
+            except ValueError:
+                pass
 
     if results:
         _bulk_upsert(settings.database_url, results, niche, store_url)

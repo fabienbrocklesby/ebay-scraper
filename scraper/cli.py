@@ -21,10 +21,15 @@ from scraper.db import (
 from scraper.export import export_to_csv, export_split_csv
 from scraper.fetch import ChallengeError
 from scraper.marketplace import detect_marketplace
-from scraper.queue import enqueue_items, get_queue, get_redis, queue_is_drained, resolve_proxy, PROXY_REDIS_KEY
+from scraper.queue import (
+    enqueue_items, get_queue, get_redis, queue_is_drained, resolve_proxy,
+    resolve_isp_pool, normalize_proxy_url, PROXY_REDIS_KEY, ISP_POOL_REDIS_KEY,
+    SCRAPED_SET_KEY,
+)
 from scraper.scraper import scrape_item
 from scraper.store import (
     _normalize_store_url, extract_seller_id, get_item_urls_from_store,
+    get_item_urls_via_unblocker,
 )
 from scraper.unblocker import fetch_via_unblocker, load_unblocker_config, UNBLOCKER_COUNT_KEY
 from scraper.worker import start_worker
@@ -552,8 +557,10 @@ def scrape() -> None:
 _FAILED_STORES_FILE = Path.home() / ".config" / "ebay-scraper" / "failed_stores.txt"
 
 
-def _marketplace_seller_search(domain: str, seller_id: str) -> str:
-    return f"https://{domain}/sch/i.html?_ssn={seller_id}"
+def _marketplace_seller_search(domain: str, store_slug: str) -> str:
+    # Storefront, not /sch seller-search: eBay challenges seller-search from proxies
+    # but serves /str storefront pages, so this is what the crawl can actually read.
+    return f"https://{domain}/str/{store_slug}"
 
 
 def _detect_and_resolve(
@@ -563,16 +570,18 @@ def _detect_and_resolve(
     unblocker_config: Any,
     redis_conn: Any,
 ) -> str | None:
-    """Resolve a seller's home-marketplace seller-search URL, honestly.
+    """Resolve a seller's home-marketplace storefront URL.
 
-    Trust a proxy detection only when every candidate answered conclusively (a result
-    AND no undetermined/challenged domains). Otherwise we cannot tell the seller's true
-    home from a cross-listing, so never silently adopt the proxy result: escalate to an
-    authoritative unblocker detection if configured, else return None (store stays
-    unresolved and is reported loudly rather than scraped in the wrong currency).
+    Storefront pages aren't challenged like seller-search, so detection reads real
+    item counts and adopts the best conclusive domain (see detect_marketplace for the
+    priority tie-break). A domain that errored or was challenged is simply ignored, not
+    a reason to abandon a clear winner. Only when no domain returned any items do we
+    escalate to an unblocker (if configured) or return None so the store is flagged.
+    Currency is recorded per item downstream, so this resolves for catalogue
+    completeness rather than to guarantee a single currency.
     """
     outcome = detect_marketplace(seller_id, proxy_url)
-    if outcome.result is not None and not outcome.undetermined_domains:
+    if outcome.result is not None:
         if on_detected is not None:
             on_detected(outcome.result.domain, outcome.result.country)
         return _marketplace_seller_search(outcome.result.domain, seller_id)
@@ -599,6 +608,7 @@ def _discover_store(
     on_detected: Callable[[str, str], None] | None = None,
     unblocker_config: Any = None,
     redis_conn: Any = None,
+    max_pages: int = 9999,
 ) -> tuple[str, list[str]]:
     """Resolve a store's home marketplace, then crawl item URLs from that domain.
 
@@ -619,8 +629,21 @@ def _discover_store(
     if resolved is None:
         return ("unresolved", [])
     try:
-        urls = get_item_urls_from_store(resolved, proxy_url=proxy_url, requests_per_second=rps)
+        urls = get_item_urls_from_store(
+            resolved, proxy_url=proxy_url, requests_per_second=rps, max_pages=max_pages
+        )
     except ChallengeError:
+        # The cheap proxy is challenged on this seller's search surface (US/UK on a
+        # flagged pool). Escalate discovery to the unblocker if configured; item
+        # detail still goes through the proxy on the workers. No unblocker -> blocked.
+        if unblocker_config is not None and unblocker_config.enabled:
+            def _ufetch(url: str) -> str | None:
+                return fetch_via_unblocker(url, unblocker_config, redis_conn)
+            try:
+                urls = get_item_urls_via_unblocker(resolved, _ufetch)
+            except Exception:
+                return ("blocked", [])
+            return ("ok" if urls else "blocked", urls)
         return ("blocked", [])
     return ("ok" if urls else "empty", urls)
 
@@ -665,8 +688,16 @@ def _write_failed_stores(failures: list[tuple[str, str]]) -> None:
     _FAILED_STORES_FILE.write_text("".join(f"{url},{niche}\n" for url, niche in failures))
 
 
-def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, settings: "Settings"):
-    """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, unresolved, total_queued)."""
+def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, settings: "Settings",
+                   us_only: bool = False, max_pages: int = 9999):
+    """Discover + queue a list of (store_url, niche). Returns (ok, empty, blocked, unresolved, total_queued).
+
+    us_only pins every store to ebay.com (US) and skips home-marketplace detection.
+    With a US-only item-fetch pool, non-US sellers can never be fetched anyway, so
+    detecting and queuing them would only burn proxy reputation on doomed
+    wrong-country fetches; pinning US makes those sellers return empty at discovery
+    and never enter the queue. It also avoids the per-store multi-domain probes.
+    """
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
     unblocker_config = load_unblocker_config(redis_conn)
@@ -678,11 +709,13 @@ def _run_discovery(stores: list[tuple[str, str]], proxy_url: str | None, setting
     total_queued = 0
     for store_url, niche in stores:
         click.echo(f"  Crawling {store_url} ...")
+        cached = ("www.ebay.com", "us") if us_only else cached_map.get(store_url)
         outcome, item_urls = _discover_store(
             store_url, proxy_url, settings.requests_per_second,
-            cached=cached_map.get(store_url),
+            cached=cached,
             on_detected=lambda d, c, _u=store_url: _persist(_u, d, c),
             unblocker_config=unblocker_config, redis_conn=redis_conn,
+            max_pages=max_pages,
         )
         if outcome == "ok":
             queued = enqueue_items(queue, redis_conn, item_urls, niche=niche, store_url=store_url)
@@ -725,13 +758,20 @@ def _report_discovery(ok, empty, blocked, unresolved, total_queued: int) -> None
 
 @scrape.command("start")
 @click.option("--niche", default=None, help="Only scrape stores with this niche tag")
-def scrape_start(niche: str | None) -> None:
+@click.option("--us-only", is_flag=True, default=False,
+              help="Pin every store to ebay.com (US) and skip marketplace detection. "
+                   "Use with a US-only ISP pool: non-US sellers can't be fetched anyway, "
+                   "so this avoids burning proxy reputation on doomed wrong-country fetches.")
+@click.option("--cap-per-store", type=int, default=0, show_default=True,
+              help="Stop discovery after roughly this many items per store (0 = no cap). "
+                   "Caps depth on giant stores and skips the slow price-partition crawl, "
+                   "so a first full pass finishes sooner. eBay surfaces ~10000/store max.")
+def scrape_start(niche: str | None, us_only: bool, cap_per_store: int) -> None:
     """Paginate all registered stores and queue item scrape jobs for VPS workers.
 
-    Store pagination runs here on the coordinator using its own (clean) IP, which
-    eBay serves the real item grid, falling back to the proxy only if that IP is
-    challenged. Every store is reported as OK / 0-results / blocked, and anything
-    that returned nothing is saved for 'scraper scrape retry'.
+    Store pagination runs here on the coordinator through the rotating proxy. Every
+    store is reported as OK / 0-results / blocked, and anything that returned
+    nothing is saved for 'scraper scrape retry'.
     """
     settings = Settings()
 
@@ -753,7 +793,11 @@ def scrape_start(niche: str | None) -> None:
     proxy_url = resolve_proxy(redis_conn, settings)
 
     stores = [(s["store_url"], s["niche"]) for s in rows]
-    ok, empty, blocked, unresolved, total_queued = _run_discovery(stores, proxy_url, settings)
+    # eBay lists 240 items per page; max_pages bounds the per-store crawl to ~cap items.
+    max_pages = max(1, cap_per_store // 240) if cap_per_store > 0 else 9999
+    ok, empty, blocked, unresolved, total_queued = _run_discovery(
+        stores, proxy_url, settings, us_only=us_only, max_pages=max_pages
+    )
     _report_discovery(ok, empty, blocked, unresolved, total_queued)
 
 
@@ -848,30 +892,53 @@ def scrape_stop() -> None:
 
 
 @scrape.command("status")
-def scrape_status() -> None:
-    """Show scrape progress: queue depth, scraped counts, and registered stores."""
+@click.option("--stores", "show_stores", is_flag=True, default=False,
+              help="Also list every registered store (long).")
+def scrape_status(show_stores: bool) -> None:
+    """Show progress at a glance: how many items are done and how many to go.
+
+    "Discovered" is every item URL found by the store crawl and queued for
+    scraping. "Scraped" is what has landed in the database. Remaining is the gap.
+    Run it on a loop to watch progress:  watch -n 30 scraper scrape status
+    """
+    from rq.registry import StartedJobRegistry, DeferredJobRegistry
+
     settings = Settings()
     redis_conn = get_redis(settings.redis_url)
     queue = get_queue(redis_conn)
+    pool_size = len(resolve_isp_pool(redis_conn))
+    discovered = int(redis_conn.scard(SCRAPED_SET_KEY) or 0)
+    pending_batches = len(queue)
+    in_flight = StartedJobRegistry(queue=queue).count
+    awaiting_retry = DeferredJobRegistry(queue=queue).count
 
     async def _run() -> tuple:
         pool = await asyncpg.create_pool(settings.database_url)
         try:
-            counts = await get_counts(pool)
-            stores = await list_stores(pool)
+            return await get_counts(pool), await list_stores(pool)
         finally:
             await pool.close()
-        return counts, stores
 
     counts, stores = asyncio.run(_run())
-    total = sum(counts.values())
-    click.echo(f"Queued jobs:   {len(queue)}")
-    click.echo(f"Total scraped: {total}")
+    done = sum(counts.values())
+    remaining = max(discovered - done, 0)
+    pct = (done / discovered * 100) if discovered else 0.0
+
+    click.echo("=== eBay Scraper status ===")
+    click.echo(f"Stores registered:  {len(stores)}")
+    click.echo(f"ISP pool IPs:       {pool_size}")
+    click.echo("")
+    click.echo(f"Items discovered:   {discovered:,}   (found by store crawl, queued to scrape)")
+    click.echo(f"Items scraped:      {done:,}   ({pct:.1f}% done)")
+    click.echo(f"Remaining:          {remaining:,}")
+    click.echo("")
+    click.echo(f"Work queue:         {pending_batches} batches pending, "
+               f"{in_flight} in flight, {awaiting_retry} awaiting retry")
     if counts:
-        click.echo("\nPer-niche:")
+        click.echo("\nScraped per niche:")
         for n, c in sorted(counts.items()):
-            click.echo(f"  {n}: {c}")
-    if stores:
+            click.echo(f"  {n}: {c:,}")
+    if show_stores and stores:
         click.echo(f"\nRegistered stores ({len(stores)}):")
         for s in stores:
             click.echo(f"  {s['store_url']}  [{s['niche']}]")
@@ -1001,6 +1068,109 @@ def proxy_clear() -> None:
         ) + "\n")
 
     click.echo("Proxy cleared. Workers will make direct requests on their next job.")
+
+
+@proxy.group("pool")
+def proxy_pool() -> None:
+    """Manage the static ISP proxy pool used for item-detail fetching.
+
+    Discovery (store pagination) uses the rotating proxy from 'scraper proxy set';
+    the bulk item fetches are spread across this flat-rate ISP pool, one IP per
+    request, each IP independently rate-limited. Add IPs as you buy them: workers
+    pick up new members on their next batch, so the pool scales live with no restart.
+    """
+
+
+@proxy_pool.command("add")
+@click.argument("proxy_url")
+def proxy_pool_add(proxy_url: str) -> None:
+    """Add an ISP proxy to the pool. Accepts IPRoyal's host:port:user:pass format."""
+    try:
+        normalized = normalize_proxy_url(proxy_url)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    added = redis_conn.sadd(ISP_POOL_REDIS_KEY, normalized)
+    pool = resolve_isp_pool(redis_conn)
+    masked = normalized.split("@")[-1]
+    if added:
+        click.echo(f"Added ISP IP ...@{masked}. Pool now has {len(pool)} IP(s).")
+    else:
+        click.echo(f"ISP IP ...@{masked} already in pool ({len(pool)} IP(s)).")
+    click.echo("Workers spread item fetches across the pool on their next batch.")
+
+
+@proxy_pool.command("list")
+def proxy_pool_list() -> None:
+    """List the ISP IPs in the pool (passwords masked)."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    pool = resolve_isp_pool(redis_conn)
+    if not pool:
+        click.echo("ISP pool is empty. Add IPs with 'scraper proxy pool add <host:port:user:pass>'.")
+        return
+    click.echo(f"ISP pool ({len(pool)} IP(s)):")
+    for entry in pool:
+        click.echo(f"  ...@{entry.split('@')[-1]}")
+
+
+@proxy_pool.command("remove")
+@click.argument("proxy_url")
+def proxy_pool_remove(proxy_url: str) -> None:
+    """Remove an ISP proxy from the pool."""
+    try:
+        normalized = normalize_proxy_url(proxy_url)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    removed = redis_conn.srem(ISP_POOL_REDIS_KEY, normalized)
+    pool = resolve_isp_pool(redis_conn)
+    if removed:
+        click.echo(f"Removed. Pool now has {len(pool)} IP(s).")
+    else:
+        click.echo(f"Not found in pool ({len(pool)} IP(s)). 'scraper proxy pool list' to see members.")
+
+
+@proxy_pool.command("clear")
+def proxy_pool_clear() -> None:
+    """Empty the ISP pool. Item fetches fall back to the box/residential path."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    redis_conn.delete(ISP_POOL_REDIS_KEY)
+    click.echo("ISP pool cleared.")
+
+
+@proxy_pool.command("test")
+@click.option("--item-url", default="https://www.ebay.com/itm/397681222313",
+              help="eBay item URL to test each pool IP against")
+def proxy_pool_test(item_url: str) -> None:
+    """Fetch a live eBay item through each pool IP and report OK / blocked per IP."""
+    settings = Settings()
+    redis_conn = get_redis(settings.redis_url)
+    pool = resolve_isp_pool(redis_conn)
+    if not pool:
+        click.echo("ISP pool is empty. Add IPs with 'scraper proxy pool add <...>'.")
+        return
+    click.echo(f"Testing {len(pool)} pool IP(s) against {item_url} ...")
+    ok = 0
+    for entry in pool:
+        masked = entry.split("@")[-1]
+        try:
+            result = scrape_item(item_url, proxy_url=entry)
+        except ChallengeError:
+            click.echo(f"  BLOCK  ...@{masked}  (challenge / 403)")
+            continue
+        except Exception as exc:
+            click.echo(f"  ERR    ...@{masked}  {exc}")
+            continue
+        if result:
+            ok += 1
+            click.echo(f"  OK     ...@{masked}  {result.title[:40]}")
+        else:
+            click.echo(f"  EMPTY  ...@{masked}  (no product data; item may be ended)")
+    click.echo(f"\n{ok}/{len(pool)} pool IP(s) OK.")
 
 
 # ---------------------------------------------------------------------------

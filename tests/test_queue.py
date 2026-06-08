@@ -169,3 +169,48 @@ def test_queue_is_drained_false_when_scheduled():
          patch("scraper.queue.DeferredJobRegistry", return_value=deferred_registry), \
          patch("scraper.queue.ScheduledJobRegistry", return_value=scheduled_registry):
         assert queue_is_drained(mock_queue) is False
+
+
+def test_normalize_proxy_url_iproyal_colon_format():
+    from scraper.queue import normalize_proxy_url
+    assert normalize_proxy_url("161.77.128.251:12323:user1:passabc") == \
+        "http://user1:passabc@161.77.128.251:12323"
+
+
+def test_normalize_proxy_url_passes_through_full_url():
+    from scraper.queue import normalize_proxy_url
+    assert normalize_proxy_url("http://u:p@host:8080") == "http://u:p@host:8080"
+    assert normalize_proxy_url("https://u:p@host:8080") == "https://u:p@host:8080"
+
+
+def test_normalize_proxy_url_host_port_only():
+    from scraper.queue import normalize_proxy_url
+    assert normalize_proxy_url("1.2.3.4:9999") == "http://1.2.3.4:9999"
+
+
+def test_normalize_proxy_url_strips_whitespace():
+    from scraper.queue import normalize_proxy_url
+    assert normalize_proxy_url("  1.2.3.4:9999:u:p  ") == "http://u:p@1.2.3.4:9999"
+
+
+def test_normalize_proxy_url_rejects_garbage():
+    import pytest
+    from scraper.queue import normalize_proxy_url
+    with pytest.raises(ValueError):
+        normalize_proxy_url("not-a-proxy")
+
+
+def test_resolve_isp_pool_returns_sorted_normalized():
+    from scraper.queue import resolve_isp_pool, ISP_POOL_REDIS_KEY
+    class R:
+        def smembers(self, k):
+            assert k == ISP_POOL_REDIS_KEY
+            return {b"http://u:p@2.2.2.2:1", b"http://u:p@1.1.1.1:1"}
+    assert resolve_isp_pool(R()) == ["http://u:p@1.1.1.1:1", "http://u:p@2.2.2.2:1"]
+
+
+def test_resolve_isp_pool_empty_when_unset():
+    from scraper.queue import resolve_isp_pool
+    class R:
+        def smembers(self, k): return set()
+    assert resolve_isp_pool(R()) == []

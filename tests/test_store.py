@@ -177,3 +177,123 @@ def test_extract_item_urls_general_fallback_for_search_pages():
     urls = _extract_item_urls(html)
     assert "https://www.ebay.com/itm/123456789012" in urls
     assert "https://www.ebay.com/itm/987654321098" in urls
+
+
+def _unblocker_page(item_ids, has_next):
+    items = "".join(
+        f'<a class="str-item-card__link" href="https://www.ebay.com/itm/{i}">x</a>'
+        for i in item_ids
+    )
+    nxt = '<a class="pagination__next" href="#">Next</a>' if has_next else ""
+    return f"<html><body>{items}{nxt}</body></html>"
+
+
+def _page_num(url):
+    import re as _re
+    return int(_re.search(r"_pgn=(\d+)", url).group(1))
+
+
+def test_get_item_urls_via_unblocker_paginates_until_no_next():
+    from scraper.store import get_item_urls_via_unblocker
+    pages = {
+        1: _unblocker_page(["111111111111", "222222222222"], has_next=True),
+        2: _unblocker_page(["333333333333"], has_next=False),
+    }
+    calls = []
+
+    def fake_fetch(url):
+        calls.append(url)
+        return pages.get(_page_num(url))
+
+    urls = get_item_urls_via_unblocker("https://www.ebay.com/sch/i.html?_ssn=x", fake_fetch)
+    assert urls == [
+        "https://www.ebay.com/itm/111111111111",
+        "https://www.ebay.com/itm/222222222222",
+        "https://www.ebay.com/itm/333333333333",
+    ]
+    assert [_page_num(c) for c in calls] == [1, 2]
+
+
+def test_get_item_urls_via_unblocker_stops_on_empty_page():
+    from scraper.store import get_item_urls_via_unblocker
+    pages = {1: _unblocker_page(["111111111111"], has_next=True), 2: "<html></html>"}
+    urls = get_item_urls_via_unblocker(
+        "https://www.ebay.com/sch/i.html?_ssn=x", lambda u: pages.get(_page_num(u))
+    )
+    assert urls == ["https://www.ebay.com/itm/111111111111"]
+
+
+def test_get_item_urls_via_unblocker_empty_when_fetch_fails():
+    from scraper.store import get_item_urls_via_unblocker
+    urls = get_item_urls_via_unblocker(
+        "https://www.ebay.com/sch/i.html?_ssn=x", lambda u: None
+    )
+    assert urls == []
+
+
+def test_get_item_urls_via_unblocker_treats_challenge_as_stop_not_data():
+    from scraper.store import get_item_urls_via_unblocker
+    pages = {
+        1: _unblocker_page(["111111111111"], has_next=True),
+        2: "<html><title>Security Measure</title></html>",
+    }
+    urls = get_item_urls_via_unblocker(
+        "https://www.ebay.com/sch/i.html?_ssn=x", lambda u: pages.get(_page_num(u))
+    )
+    assert urls == ["https://www.ebay.com/itm/111111111111"]
+
+
+def test_get_item_urls_retries_flaky_empty_page_not_truncate(monkeypatch):
+    """A transient empty page mid-crawl must be retried on a fresh session, not
+    read as end-of-store. In production a 0-item page wedged between full pages
+    truncated a 1.9M store to ~1,400 items."""
+    import re as _re
+
+    def page(ids, nxt):
+        items = "".join(
+            f'<a class="str-item-card__link" href="https://www.ebay.com/itm/{i}">x</a>'
+            for i in ids
+        )
+        n = '<a class="pagination__next" href="#">Next</a>' if nxt else ""
+        return f"<html><body>{items}{n}</body></html>"
+
+    class Scripted:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def get(self, url, **kw):
+            m = _re.search(r"_pgn=(\d+)", url)
+            html = "<html><body>home</body></html>" if not m else self.pages.get(
+                int(m.group(1)), "<html></html>"
+            )
+            return _FakeResponse(html)
+
+        def close(self):
+            pass
+
+    sessions = [
+        Scripted({1: page(["111111111111"], True), 2: "<html><body></body></html>"}),
+        Scripted({2: page(["222222222222"], False)}),
+    ]
+    monkeypatch.setattr("scraper.store.build_session", lambda proxy_url=None: sessions.pop(0))
+    monkeypatch.setattr("scraper.store.time.sleep", lambda *_a: None)
+
+    urls = get_item_urls_from_store("https://www.ebay.com/str/seller", proxy_url="http://x")
+    assert "https://www.ebay.com/itm/111111111111" in urls
+    assert "https://www.ebay.com/itm/222222222222" in urls
+    assert sessions == []  # initial session + one fresh-IP retry, both consumed
+
+
+def test_get_item_urls_genuinely_empty_store_ends_after_retries(monkeypatch):
+    """A store that is empty on every retry ends cleanly with no items."""
+    class Empty:
+        def get(self, url, **kw):
+            return _FakeResponse("<html><body></body></html>")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("scraper.store.build_session", lambda proxy_url=None: Empty())
+    monkeypatch.setattr("scraper.store.time.sleep", lambda *_a: None)
+    urls = get_item_urls_from_store("https://www.ebay.com/str/seller", proxy_url="http://x")
+    assert urls == []

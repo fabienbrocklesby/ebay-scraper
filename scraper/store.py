@@ -1,6 +1,6 @@
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
@@ -17,6 +17,13 @@ _ITEMS_PER_PAGE = 240
 # large stores. Without a proxy (direct from the coordinator IP) rotating gains
 # nothing, so it is skipped.
 _PAGES_PER_SESSION = 10
+
+# eBay intermittently serves a short/empty listing page mid-crawl (observed: a
+# ~130KB page with 0 items wedged between two full pages). Treating that as the
+# end of the store silently truncated a large catalogue, so an empty page is
+# re-fetched (on a fresh IP when rotating) this many times before it is accepted
+# as the genuine end of the store.
+_EMPTY_PAGE_RETRIES = 2
 
 
 def extract_seller_id(store_url: str) -> str:
@@ -137,6 +144,38 @@ def _recover_from_challenge(
         f"({gathered} items gathered before the block). Configure a rotating "
         f"residential proxy (scraper proxy set <url>) or retry later."
     )
+
+
+def _retry_empty_page(
+    client: Any,
+    base_store_url: str,
+    homepage: str,
+    page: int,
+    proxy_url: str | None,
+    delay: float,
+    rotating: bool,
+    max_retries: int,
+) -> tuple[Any, str | None, list[str]]:
+    """Re-fetch a page that returned no items, to tell a transient empty page apart
+    from the real end of the store.
+
+    With a rotating proxy each retry rebuilds the session for a fresh exit IP (the
+    usual cause of a degraded page); otherwise the same session is reused. Returns
+    (client, html, item_urls): item_urls is non-empty when a retry recovers items
+    and the crawl should continue, or empty when the store has genuinely ended.
+    """
+    for _ in range(max_retries):
+        time.sleep(delay)
+        if rotating:
+            client.close()
+            client = build_session(proxy_url)
+            _warmup(client, homepage, delay)
+        html = _fetch_listing_page(client, _page_url(base_store_url, page), homepage)
+        if html is not None and not is_challenge_page(html):
+            urls = _extract_item_urls(html)
+            if urls:
+                return client, html, urls
+    return client, None, []
 
 
 # eBay stops paginating store/search browse around 10 000 results. When a crawl
@@ -326,6 +365,14 @@ def get_item_urls_from_store(
                 pages_on_session = 1
 
             page_urls = _extract_item_urls(html)
+
+            if not page_urls and own_client:
+                client, html, page_urls = _retry_empty_page(
+                    client, base_store_url, homepage, page, proxy_url, delay,
+                    rotating, _EMPTY_PAGE_RETRIES,
+                )
+                pages_on_session = 1
+
             for url in page_urls:
                 seen[url] = None
 
@@ -352,4 +399,55 @@ def get_item_urls_from_store(
         finally:
             extra_client.close()
 
+    return list(seen.keys())
+
+
+def _paginate_via(
+    fetch_fn: Callable[[str], str | None], base_url: str, max_pages: int
+) -> dict[str, None]:
+    """Paginate a listing URL using a caller-supplied page fetcher.
+
+    fetch_fn(page_url) returns the page HTML, or None on failure. A None page, a
+    challenge page, or a page with no items ends pagination, exactly as the proxy
+    crawl treats those, so a degraded response never reads as a clean end-of-store.
+    """
+    seen: dict[str, None] = {}
+    page = 1
+    while page <= max_pages:
+        html = fetch_fn(_page_url(base_url, page))
+        if not html or is_challenge_page(html):
+            break
+        page_urls = _extract_item_urls(html)
+        if not page_urls:
+            break
+        for url in page_urls:
+            seen[url] = None
+        if not _has_next_page(html):
+            break
+        page += 1
+    return seen
+
+
+def get_item_urls_via_unblocker(
+    store_url: str,
+    unblock_fetch: Callable[[str], str | None],
+    max_pages: int = 9999,
+) -> list[str]:
+    """Discover a seller's item URLs through a paid-unblocker fetch callable.
+
+    eBay challenges the residential proxy on its seller-search surface for some
+    countries (notably US/UK on a flagged pool) while still serving item-detail
+    pages to that same proxy. When the normal crawl is blocked, discovery escalates
+    here: only the seller-search pagination (a small fraction of total requests)
+    runs through the unblocker; item-detail fetches stay on the cheap proxy. Mirrors
+    get_item_urls_from_store's price-partitioning past eBay's ~10k browse ceiling so
+    large stores are not truncated.
+    """
+    base_store_url = _normalize_store_url(store_url)
+    seen = _paginate_via(unblock_fetch, base_store_url, max_pages)
+    if len(seen) >= _BROWSE_CEILING:
+        for lo, hi in _price_partitions(0, _BROWSE_CEILING):
+            seen.update(
+                _paginate_via(unblock_fetch, _partition_url(base_store_url, lo, hi), max_pages)
+            )
     return list(seen.keys())

@@ -60,16 +60,21 @@ def test_detect_and_resolve_adopts_confident_proxy_result(monkeypatch):
         unblocker_config=None,
         redis_conn=None,
     )
-    assert url == "https://www.ebay.com.au/sch/i.html?_ssn=aussie"
+    # Detection resolves to the seller's home-marketplace storefront (/str), which is
+    # what the crawl can actually paginate (eBay challenges /sch from proxies).
+    assert url == "https://www.ebay.com.au/str/aussie"
     assert captured == {"domain": "www.ebay.com.au", "country": "au"}
 
 
-def test_detect_and_resolve_does_not_adopt_when_undetermined_and_unblocker_off(monkeypatch):
+def test_detect_and_resolve_adopts_best_even_when_some_domains_undetermined(monkeypatch):
     import scraper.cli as c
     from scraper.marketplace import DetectionOutcome, MarketplaceResult
     from scraper.unblocker import UnblockerConfig
-    called = {"on_detected": False}
+    captured = {}
 
+    # A clear winner (.com.au) with another candidate left undetermined is still
+    # adopted: cross-listing means an undetermined sibling is not a reason to abandon
+    # a conclusive home marketplace.
     monkeypatch.setattr(c, "detect_marketplace", lambda seller_id, proxy_url, **kw: DetectionOutcome(
         result=MarketplaceResult("www.ebay.com.au", "au", 186,
                                  "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
@@ -79,12 +84,12 @@ def test_detect_and_resolve_does_not_adopt_when_undetermined_and_unblocker_off(m
     url = c._detect_and_resolve(
         seller_id="aussie",
         proxy_url="http://proxy",
-        on_detected=lambda domain, country: called.update(on_detected=True),
+        on_detected=lambda domain, country: captured.update(domain=domain, country=country),
         unblocker_config=UnblockerConfig("none", None, None),
         redis_conn=None,
     )
-    assert url is None
-    assert called["on_detected"] is False
+    assert url == "https://www.ebay.com.au/str/aussie"
+    assert captured == {"domain": "www.ebay.com.au", "country": "au"}
 
 
 def test_detect_and_resolve_escalates_to_unblocker_when_undetermined(monkeypatch):
@@ -100,10 +105,11 @@ def test_detect_and_resolve_escalates_to_unblocker_when_undetermined(monkeypatch
                                          "https://www.ebay.com/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
                 undetermined_domains=[],
             )
-        return DetectionOutcome(  # proxy probe: home left undetermined
-            result=MarketplaceResult("www.ebay.com.au", "au", 186,
-                                     "https://www.ebay.com.au/sch/i.html?_ssn=aussie&_pgn=1&_ipg=240"),
-            undetermined_domains=["www.ebay.com"],
+        # Proxy probe is challenged on every candidate, so it yields no conclusive
+        # home marketplace: only then does detection escalate to the unblocker.
+        return DetectionOutcome(
+            result=None,
+            undetermined_domains=["www.ebay.com", "www.ebay.com.au"],
         )
 
     monkeypatch.setattr(c, "detect_marketplace", fake_detect)
@@ -116,7 +122,7 @@ def test_detect_and_resolve_escalates_to_unblocker_when_undetermined(monkeypatch
         unblocker_config=UnblockerConfig("oxylabs", "user", "pass"),
         redis_conn=None,
     )
-    assert url == "https://www.ebay.com/sch/i.html?_ssn=aussie"
+    assert url == "https://www.ebay.com/str/aussie"
     assert captured == {"domain": "www.ebay.com", "country": "us"}
 
 
@@ -125,7 +131,7 @@ def test_discover_store_cached_skips_detection(monkeypatch):
     monkeypatch.setattr(c, "detect_marketplace",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not detect")))
     monkeypatch.setattr(c, "get_item_urls_from_store",
-                        lambda url, proxy_url=None, requests_per_second=0.5: [])
+                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999: [])
     assert c._discover_store(
         "https://www.ebay.com/str/aussie", "http://proxy", 0.5, cached=("www.ebay.com.au", "au")
     ) == ("empty", [])
@@ -134,7 +140,7 @@ def test_discover_store_cached_skips_detection(monkeypatch):
 def test_discover_store_empty_trusts_clean_zero(monkeypatch):
     import scraper.cli as c
     monkeypatch.setattr(c, "get_item_urls_from_store",
-                        lambda url, proxy_url=None, requests_per_second=0.5: [])
+                        lambda url, proxy_url=None, requests_per_second=0.5, max_pages=9999: [])
     # cached marketplace skips detection; a clean crawl with no items is a genuinely empty store
     assert c._discover_store(
         "https://www.ebay.com/str/x", "http://proxy", 0.5, cached=("www.ebay.com", "us")
@@ -145,7 +151,7 @@ def test_discover_store_blocked_on_crawl_challenge(monkeypatch):
     import scraper.cli as c
     from scraper.fetch import ChallengeError
 
-    def fake(url, proxy_url=None, requests_per_second=0.5):
+    def fake(url, proxy_url=None, requests_per_second=0.5, max_pages=9999):
         raise ChallengeError("blocked")
 
     monkeypatch.setattr(c, "get_item_urls_from_store", fake)
@@ -202,3 +208,86 @@ def test_probe_proxy_ok_false_if_all_marketplaces_flagged(monkeypatch):
     from scraper import cli
     monkeypatch.setattr(cli, "_probe_proxy_markets", lambda p: {"US": False, "AU": False, "UK": False})
     assert cli._probe_proxy_ok("http://x") is False
+
+
+class _FakePoolRedis:
+    def __init__(self):
+        self.members = set()
+    def sadd(self, key, val):
+        before = len(self.members)
+        self.members.add(val)
+        return len(self.members) - before
+    def srem(self, key, val):
+        if val in self.members:
+            self.members.discard(val)
+            return 1
+        return 0
+    def smembers(self, key):
+        return set(self.members)
+    def delete(self, key):
+        self.members.clear()
+
+
+def _pool_runner(monkeypatch):
+    from click.testing import CliRunner
+    import scraper.cli as c
+    fake = _FakePoolRedis()
+    monkeypatch.setattr(c, "get_redis", lambda url: fake)
+    monkeypatch.setattr(c, "Settings", lambda: type("S", (), {"redis_url": "redis://x"})())
+    return CliRunner(), fake
+
+
+def test_proxy_pool_add_normalizes_and_stores(monkeypatch):
+    from scraper.cli import cli
+    runner, fake = _pool_runner(monkeypatch)
+    result = runner.invoke(cli, ["proxy", "pool", "add", "1.2.3.4:9999:user:pass"])
+    assert result.exit_code == 0
+    assert fake.members == {"http://user:pass@1.2.3.4:9999"}
+    assert "1 IP(s)" in result.output
+
+
+def test_proxy_pool_add_rejects_garbage(monkeypatch):
+    from scraper.cli import cli
+    runner, fake = _pool_runner(monkeypatch)
+    result = runner.invoke(cli, ["proxy", "pool", "add", "garbage"])
+    assert result.exit_code != 0
+    assert fake.members == set()
+
+
+def test_proxy_pool_list_and_remove(monkeypatch):
+    from scraper.cli import cli
+    runner, fake = _pool_runner(monkeypatch)
+    runner.invoke(cli, ["proxy", "pool", "add", "1.2.3.4:9999:user:pass"])
+    listed = runner.invoke(cli, ["proxy", "pool", "list"])
+    assert "1.2.3.4:9999" in listed.output
+    removed = runner.invoke(cli, ["proxy", "pool", "remove", "1.2.3.4:9999:user:pass"])
+    assert removed.exit_code == 0
+    assert fake.members == set()
+
+
+def test_run_discovery_us_only_pins_com_and_skips_detection(monkeypatch):
+    import scraper.cli as c
+    monkeypatch.setattr(c, "get_redis", lambda url: object())
+    monkeypatch.setattr(c, "get_queue", lambda conn: object())
+    monkeypatch.setattr(c, "load_unblocker_config", lambda conn: None)
+    monkeypatch.setattr(c, "_load_cached_marketplaces", lambda urls: __import__("asyncio").sleep(0, result={}))
+    monkeypatch.setattr(c, "detect_marketplace",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("detection must be skipped in us_only")))
+    seen = {}
+
+    def fake_get_urls(url, proxy_url=None, requests_per_second=0.5, max_pages=9999):
+        seen["url"] = url
+        return ["https://www.ebay.com/itm/111111111111"]
+
+    monkeypatch.setattr(c, "get_item_urls_from_store", fake_get_urls)
+    monkeypatch.setattr(c, "enqueue_items", lambda *a, **k: 1)
+
+    class S:
+        redis_url = "redis://x"
+        requests_per_second = 0.5
+
+    ok, empty, blocked, unresolved, total = c._run_discovery(
+        [("https://www.ebay.com/str/someseller", "auto")], "http://res", S(), us_only=True
+    )
+    assert ok == ["https://www.ebay.com/str/someseller"]
+    assert seen["url"] == "https://www.ebay.com/str/someseller"

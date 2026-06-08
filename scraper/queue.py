@@ -5,6 +5,11 @@ from rq.registry import StartedJobRegistry, DeferredJobRegistry, ScheduledJobReg
 
 SCRAPED_SET_KEY = "scraped_items"
 PROXY_REDIS_KEY = "ebay-scraper:proxy_url"
+# A Redis set of static ISP proxy URLs used for item-detail fetching. Discovery
+# (store pagination) uses the rotating proxy at PROXY_REDIS_KEY; the bulk item
+# fetches are spread across this flat-rate pool. Adding a member here makes the
+# next batch start using that IP, so the pool scales live with no restart.
+ISP_POOL_REDIS_KEY = "ebay-scraper:isp_pool"
 
 # A scrape job that hits eBay's bot challenge raises rather than dropping the
 # item. These retries requeue it on an escalating delay so a later attempt (on a
@@ -33,6 +38,46 @@ def resolve_proxy(redis_conn, settings) -> str | None:
         value = raw.decode().strip()
         return value or None
     return settings.proxy_url or None
+
+
+def normalize_proxy_url(raw: str) -> str:
+    """Normalize a proxy string into a full URL the HTTP client accepts.
+
+    Accepts the IPRoyal copy-paste format `host:port:user:pass`, a bare
+    `host:port`, or an already-complete `http(s)://user:pass@host:port`. Returns
+    `http://user:pass@host:port` (or `http://host:port` when no credentials).
+    Raises ValueError on anything that is not recognisably one of these so a typo
+    never gets silently stored as an unusable pool member.
+    """
+    value = raw.strip()
+    if not value:
+        raise ValueError("empty proxy string")
+    if "://" in value:
+        return value
+    parts = value.split(":")
+    if len(parts) == 2:
+        host, port = parts
+    elif len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    else:
+        raise ValueError(
+            f"unrecognised proxy format: expected host:port, host:port:user:pass, "
+            f"or a full URL, got {raw!r}"
+        )
+    if not (host and port.isdigit()):
+        raise ValueError(f"unrecognised proxy format: {raw!r}")
+    return f"http://{host}:{port}"
+
+
+def resolve_isp_pool(redis_conn) -> list[str]:
+    """Return the configured static ISP proxy pool, sorted for deterministic order.
+
+    Members are stored already-normalized (see normalize_proxy_url). Sorting keeps
+    the per-batch round-robin assignment stable across workers reading the same set.
+    """
+    members = redis_conn.smembers(ISP_POOL_REDIS_KEY)
+    return sorted(m.decode() if isinstance(m, bytes) else m for m in members)
 
 
 def get_redis(redis_url: str) -> redis_lib.Redis:

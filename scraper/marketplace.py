@@ -18,11 +18,17 @@ logger = logging.getLogger(__name__)
 from scraper.fetch import ChallengeError, apply_proxy_country, build_session, is_challenge_page
 from scraper.store import _extract_item_urls
 
-# Ordered list of the marketplaces Kieran's stores live on. Extend as new ones appear.
+# Ordered in home-marketplace priority. eBay surfaces a seller's items on several
+# marketplaces (cross-border listings), each capped at one ~200-item page, so a tie at
+# the cap is normal, not ambiguous. Probes run concurrently; extend as new seller
+# countries appear. Order matters: ties break toward the earlier (more likely home)
+# domain, since `detect_marketplace` keeps the first domain that reaches the top count.
 CANDIDATE_MARKETPLACES: list[tuple[str, str]] = [
     ("www.ebay.com", "us"),
     ("www.ebay.com.au", "au"),
     ("www.ebay.co.uk", "gb"),
+    ("www.ebay.de", "de"),
+    ("www.ebay.ca", "ca"),
 ]
 
 # Detection picks the domain with the most items, so the page size must be large enough
@@ -52,11 +58,12 @@ class DetectionOutcome:
     undetermined_domains: list[str]
 
 
-def _seller_search_url(domain: str, seller_id: str) -> str:
-    return (
-        f"https://{domain}/sch/i.html?_ssn={seller_id}"
-        f"&_pgn=1&_ipg={_DETECT_ITEMS_PER_PAGE}"
-    )
+def _seller_search_url(domain: str, store_slug: str) -> str:
+    # eBay challenges /sch seller-search from proxies but serves /str storefront
+    # pages freely, so detection probes the storefront (and the crawl uses it too).
+    # The id threaded through is the store slug: extract_seller_id returns the
+    # /str/<slug>, so feeding storefront URLs keeps this consistent end to end.
+    return f"https://{domain}/str/{store_slug}?_pgn=1&_ipg={_DETECT_ITEMS_PER_PAGE}"
 
 
 def _default_fetch(url: str, proxy_url: Optional[str]) -> str:
@@ -117,6 +124,10 @@ def detect_marketplace(
     undetermined = [p.domain for p in probes if p.challenged]
 
     if with_items:
+        # max keeps the first domain reaching the top count, and candidates are in
+        # home priority order, so a cross-listing tie at the page cap breaks toward the
+        # most likely home (.com for US sellers, else .com.au, ...). Currency is recorded
+        # per item downstream, so this picks for catalogue completeness, not currency.
         best = max(with_items, key=lambda p: p.item_count)
         return DetectionOutcome(
             result=MarketplaceResult(best.domain, best.country, best.item_count, best.url),

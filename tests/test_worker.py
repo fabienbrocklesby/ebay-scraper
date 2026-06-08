@@ -85,6 +85,7 @@ def test_scrape_batch_fetches_concurrently_and_bulk_writes(monkeypatch):
     # get_redis is imported inside scrape_batch via late import; patch at queue level
     import scraper.queue as q
     monkeypatch.setattr(q, "get_redis", lambda url: None)
+    monkeypatch.setattr(w, "resolve_isp_pool", lambda conn: [])
 
     def fake_scrape_one(url, residential, state, bucket):
         if url.endswith("999"):
@@ -114,6 +115,7 @@ def test_scrape_batch_drops_failures_after_max_attempts(monkeypatch):
 
     import scraper.queue as q
     monkeypatch.setattr(q, "get_redis", lambda url: None)
+    monkeypatch.setattr(w, "resolve_isp_pool", lambda conn: [])
 
     monkeypatch.setattr(w, "_scrape_one", lambda *a, **k: (_ for _ in ()).throw(Exception("x")))
     monkeypatch.setattr(w, "_bulk_upsert", lambda *a, **k: None)
@@ -219,3 +221,80 @@ def test_404_none_passes_through_no_escalation(monkeypatch):
     )
     assert out is None
     assert called["unblocker"] is False
+
+
+def test_run_pool_fetch_round_robin_and_split(monkeypatch):
+    import scraper.worker as w
+    pool = ["http://u:p@1.1.1.1:1", "http://u:p@2.2.2.2:1"]
+    seen = []
+
+    def fake_fetch(url, proxy):
+        seen.append((url, proxy))
+        if url.endswith("333333333333"):
+            raise w.ChallengeError("blocked")
+        return _pd(url.rsplit("/", 1)[1])
+
+    urls = [
+        "https://www.ebay.com/itm/111111111111",
+        "https://www.ebay.com/itm/222222222222",
+        "https://www.ebay.com/itm/333333333333",
+        "https://www.ebay.com/itm/444444444444",
+    ]
+    results, failed = w._run_pool_fetch(
+        urls, pool, max_rps_per_ip=1000.0, concurrency=8, fetch_one=fake_fetch
+    )
+    # round-robin: url[0]->pool[0], url[1]->pool[1], url[2]->pool[0], url[3]->pool[1]
+    assignment = {u: p for u, p in seen}
+    assert assignment[urls[0]] == pool[0]
+    assert assignment[urls[1]] == pool[1]
+    assert assignment[urls[2]] == pool[0]
+    assert assignment[urls[3]] == pool[1]
+    assert {r.item_id for r in results} == {"111111111111", "222222222222", "444444444444"}
+    assert failed == ["https://www.ebay.com/itm/333333333333"]
+
+
+def test_run_pool_fetch_none_result_is_not_failure(monkeypatch):
+    import scraper.worker as w
+    results, failed = w._run_pool_fetch(
+        ["https://www.ebay.com/itm/111111111111"],
+        ["http://u:p@1.1.1.1:1"],
+        max_rps_per_ip=1000.0, concurrency=4,
+        fetch_one=lambda url, proxy: None,
+    )
+    assert results == []
+    assert failed == []
+
+
+def test_scrape_batch_uses_isp_pool_when_present(monkeypatch):
+    import scraper.worker as w
+
+    class FakeSettings:
+        database_url = "postgresql://x/y"
+        redis_url = "redis://x"
+        max_rps_per_ip = 1000.0
+        worker_concurrency = 8
+        challenge_escalation_threshold = 0.15
+        challenge_cooldown_seconds = 1.0
+
+    monkeypatch.setattr(w, "Settings", lambda: FakeSettings())
+    monkeypatch.setattr(w, "_get_proxy_url", lambda s: "http://res")
+    monkeypatch.setattr(w, "resolve_isp_pool", lambda conn: ["http://u:p@1.1.1.1:1", "http://u:p@2.2.2.2:1"])
+    monkeypatch.setattr("scraper.queue.get_redis", lambda url: MagicMock())
+    upserted = {}
+    monkeypatch.setattr(w, "_bulk_upsert", lambda db, products, niche, store: upserted.update(n=len(products)))
+
+    calls = []
+
+    def fake_pool_fetch_one(url, proxy):
+        calls.append((url, proxy))
+        return _pd(url.rsplit("/", 1)[1])
+
+    monkeypatch.setattr(w, "_pool_fetch_one", fake_pool_fetch_one)
+
+    urls = [f"https://www.ebay.com/itm/{i}" * 1 for i in
+            ("111111111111", "222222222222", "333333333333")]
+    w.scrape_batch(urls, "watch", "https://www.ebay.com/str/s", 0)
+
+    assert upserted["n"] == 3
+    # all fetches used pool IPs, never the residential proxy
+    assert all(p in ("http://u:p@1.1.1.1:1", "http://u:p@2.2.2.2:1") for _, p in calls)

@@ -1,7 +1,12 @@
+import os
+
 import asyncpg
 import pytest
 
-TEST_DB_URL = "postgresql://scraper:scraper@localhost:5432/ebayscraper_test"
+TEST_DB_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql://scraper:scraper@localhost:5432/ebayscraper_test",
+)
 
 
 @pytest.fixture(scope="session")
