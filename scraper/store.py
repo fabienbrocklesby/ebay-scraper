@@ -120,10 +120,13 @@ def _recover_from_challenge(
     max_retries: int,
     gathered: int,
 ) -> tuple[Any, str]:
-    """Retry a challenged page on fresh sessions with escalating backoff.
+    """Retry a challenged page on fresh sessions with a short escalating backoff.
 
     Each attempt builds a new session: with a rotating residential proxy this
-    yields a fresh exit IP, which is what actually clears eBay's challenge.
+    yields a fresh exit IP, which is what actually clears eBay's challenge. Because
+    a fresh IP is available immediately, the wait is kept short (a long cooldown
+    only helps a single fixed IP); a store that stays challenged across several
+    fresh IPs is deferred quickly rather than wedging the crawl for minutes.
     Returns (surviving_session, page_html) once clear so the caller can keep
     crawling on the working session.
 
@@ -132,7 +135,7 @@ def _recover_from_challenge(
     """
     old_client.close()
     for attempt in range(1, max_retries + 1):
-        time.sleep(min(30.0 * attempt, 180.0))
+        time.sleep(min(5.0 * attempt, 20.0))
         client = build_session(proxy_url)
         _warmup(client, homepage, delay)
         html = _fetch_listing_page(client, _page_url(base_store_url, page), homepage)
