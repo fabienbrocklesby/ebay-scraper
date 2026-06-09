@@ -16,10 +16,10 @@ RETRY_INTERVAL="${RETRY_INTERVAL:-1800}"
 cd "$REPO_DIR" || exit 1
 
 echo "[discovery-loop] initial pass $(date -u)"
-"$SCRAPER" scrape start --us-only --cap-per-store "$CAP"
+"$SCRAPER" scrape start --us-only --cap-per-store "$CAP" --discover-via-pool
 
 while true; do
   sleep "$RETRY_INTERVAL"
   echo "[discovery-loop] retry pass $(date -u)"
-  "$SCRAPER" scrape retry --us-only --cap-per-store "$CAP"
+  "$SCRAPER" scrape retry --us-only --cap-per-store "$CAP" --discover-via-pool
 done
