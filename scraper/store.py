@@ -34,11 +34,17 @@ _FETCH_TIMEOUT = 30
 
 
 def extract_seller_id(store_url: str) -> str:
-    path = urlparse(store_url).path.strip("/")
+    parsed = urlparse(store_url)
+    path = parsed.path.strip("/")
     parts = path.split("/")
     if "str" in parts:
         return parts[parts.index("str") + 1]
     if "sch" in parts:
+        # /sch/i.html?_ssn=seller format: the seller name is in the query string,
+        # not in the path segment after "sch" (which is always "i.html").
+        ssn = parse_qs(parsed.query).get("_ssn", [None])[0]
+        if ssn:
+            return ssn
         return parts[parts.index("sch") + 1]
     raise ValueError(f"Cannot extract seller ID from: {store_url}")
 

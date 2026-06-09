@@ -29,6 +29,12 @@ def test_extract_seller_id_from_sch_url():
     assert extract_seller_id("https://www.ebay.com/sch/username/m.html") == "username"
 
 
+def test_extract_seller_id_from_sch_ssn_url():
+    # /sch/i.html?_ssn=seller is the common format when stores are added via seller search.
+    # The path segment after "sch" is always "i.html", so the seller name is in _ssn.
+    assert extract_seller_id("https://www.ebay.com/sch/i.html?_ssn=rokyautoparts") == "rokyautoparts"
+
+
 def test_normalize_store_url_strips_trailing_slash():
     assert _normalize_store_url("https://www.ebay.com/str/coolstore/") == "https://www.ebay.com/str/coolstore"
 
